@@ -1,28 +1,16 @@
-# --------------------------------------------------------------------------
-# render.yaml (Corregido v4)
-#
-# 1. 'databases' es una sección separada (Correcto).
-# 2. 'fromService.type' es 'postgres' (Correcto).
-# 3. 'startCommand' apunta a 'webhook_receiver:app' (Correcto).
-# 4. CORREGIDO: Se eliminaron los comentarios con acentos de las 
-#    líneas 'autoSuspend' para arreglar el error del parser.
-# --------------------------------------------------------------------------
-
 databases:
-  # 1. La Base de Datos PostgreSQL
   - name: postgres-db
-    plan: free # Plan gratuito de Render.
-    region: oregon # Especificar región para el plan gratuito
+    plan: free
+    region: oregon
 
 services:
-  # 2. El Listener de Webhooks (FastAPI)
   - type: web
     name: webhook-listener
     plan: free
     region: oregon
-    env: docker # Usar nuestro Dockerfile
-    autoSuspend: false # <-- COMENTARIO PROBLEMÁTICO ELIMINADO
-    healthCheckPath: / # Comprobar que el servicio está vivo
+    env: docker
+    autoSuspend: false
+    healthCheckPath: /
     envVars:
       - key: DATABASE_URL
         fromService:
@@ -31,17 +19,16 @@ services:
           property: connectionString 
       - key: PYTHON_VERSION
         value: "3.10.13"
-    # --- Comando para coincidir con 'webhook_receiver.py' ---
     startCommand: uvicorn webhook_receiver:app --host 0.0.0.0 --port $PORT
 
-  # 3. El Dashboard (Streamlit)
   - type: web
     name: dashboard
     plan: free
     region: oregon
-    env: docker # Usar el MISMO Dockerfile
-    autoSuspend: false # <-- COMENTARIO ELIMINADO
-    healthCheckPath: /healthz # Endpoint de salud de Streamlit
+    env: docker
+
+    autoSuspend: false
+    healthCheckPath: /healthz
     envVars:
       - key: DATABASE_URL
         fromService:
@@ -49,8 +36,7 @@ services:
           name: postgres-db
           property: connectionString 
       - key: SAMSARA_API_KEY
-        sync: false # Poner este valor manualmente en el dashboard de Render
+        sync: false
       - key: PYTHON_VERSION
         value: "3.10.13"
-    # Comando para iniciar ESTE servicio
     startCommand: streamlit run streamlit_app.py --server.port $PORT --server.enableCORS false --server.enableXsrfProtection false
