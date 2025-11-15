@@ -1,14 +1,25 @@
+# --------------------------------------------------------------------------
+# render.yaml (Corregido v5)
+#
+# 1. CORREGIDO: La indentación de autoSuspend, healthCheckPath,
+#    envVars, y startCommand ahora es de 2 espacios,
+#    al mismo nivel que 'type' y 'name'.
+# --------------------------------------------------------------------------
+
 databases:
+  # 1. La Base de Datos PostgreSQL
   - name: postgres-db
     plan: free
     region: oregon
 
 services:
+  # 2. El Listener de Webhooks (FastAPI)
   - type: web
     name: webhook-listener
     plan: free
     region: oregon
-    env: docker
+    env: docker # Usar nuestro Dockerfile
+    # --- INDENTACIÓN CORREGIDA (2 ESPACIOS) ---
     autoSuspend: false
     healthCheckPath: /
     envVars:
@@ -21,12 +32,13 @@ services:
         value: "3.10.13"
     startCommand: uvicorn webhook_receiver:app --host 0.0.0.0 --port $PORT
 
+  # 3. El Dashboard (Streamlit)
   - type: web
     name: dashboard
     plan: free
     region: oregon
-    env: docker
-
+    env: docker # Usar el MISMO Dockerfile
+    # --- INDENTACIÓN CORREGIDA (2 ESPACIOS) ---
     autoSuspend: false
     healthCheckPath: /healthz
     envVars:
@@ -36,7 +48,7 @@ services:
           name: postgres-db
           property: connectionString 
       - key: SAMSARA_API_KEY
-        sync: false
+        sync: false # Poner este valor manualmente en el dashboard de Render
       - key: PYTHON_VERSION
         value: "3.10.13"
     startCommand: streamlit run streamlit_app.py --server.port $PORT --server.enableCORS false --server.enableXsrfProtection false
