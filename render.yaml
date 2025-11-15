@@ -1,30 +1,14 @@
-# --------------------------------------------------------------------------
-# render.yaml (Corregido)
-#
-# Esta es la configuración de "Blueprint" para MÚLTIPLES servicios.
-# 1. Define una base de datos PostgreSQL.
-# 2. Define el servicio "webhook-listener" (FastAPI).
-# 3. Define el servicio "dashboard" (Streamlit).
-#
-# EL ERROR ESTABA EN LA INDENTACIÓN:
-# 'autoSuspend', 'healthCheckPath', 'envVars', y 'startCommand'
-# deben estar al mismo nivel (con 2 espacios), como 'type', 'name', etc.
-# --------------------------------------------------------------------------
-
 databases:
-  # 1. La Base de Datos PostgreSQL
   - name: postgres-db
     plan: free
     region: oregon
 
 services:
-  # 2. El Listener de Webhooks (FastAPI)
   - type: web
     name: webhook-listener
     plan: free
     region: oregon
-    env: docker # Usar nuestro Dockerfile
-    # --- INDENTACIÓN CORREGIDA (2 ESPACIOS) ---
+    env: docker
     autoSuspend: false
     healthCheckPath: /
     envVars:
@@ -37,15 +21,13 @@ services:
         value: "3.10.13"
     startCommand: uvicorn webhook_receiver:app --host 0.0.0.0 --port $PORT
 
-  # 3. El Dashboard (Streamlit)
   - type: web
     name: dashboard
     plan: free
     region: oregon
-    env: docker # Usar el MISMO Dockerfile
-    # --- INDENTACIÓN CORREGIDA (2 ESPACIOS) ---
+    env: docker
     autoSuspend: false
-    healthCheckPath: /_stcore/health # Health check específico de Streamlit
+    healthCheckPath: /_stcore/health
     envVars:
       - key: DATABASE_URL
         fromService:
@@ -53,7 +35,7 @@ services:
           name: postgres-db
           property: connectionString
       - key: SAMSARA_API_KEY
-        sync: false # Poner este valor manualmente en el dashboard de Render
+        sync: false
       - key: PYTHON_VERSION
         value: "3.10.13"
     startCommand: streamlit run streamlit_app.py --server.port $PORT --server.enableCORS false --server.enableXsrfProtection false
