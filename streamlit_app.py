@@ -5,19 +5,11 @@
 #
 # v44 (Optimización Full-Stack y KPI de Puerta Mejorado)
 #
-# - OPTIMIZACIÓN: Añadido cacheo progresivo (ttl=30s) a todas las 
-#   funciones de carga de datos en vivo (fetch_*)
-# - OPTIMIZACIÓN: Limpieza de imports y CSS.
-# - OPTIMIZACIÓN: Se confirma que el auto-refresh está en 30s.
-# - FIX (KPI BATERÍA): Se confirma que la lógica v43 es correcta. El
-#   KPI de Batería (valor, hora y mini-gráfico) se alimenta de 
-#   'df_battery_history_1h.iloc[-1]', alineado con Temp/Hum.
-# - FIX (KPI PUERTA):
-#   1. El KPI de Puerta ahora recibe los 'alert_incidents'.
-#   2. Muestra el estado de Telemetría (el más reciente, cada 30s).
-#   3. Muestra la *última alerta de puerta* recibida de la API.
-#   4. Muestra un '⚠️' si la telemetría y la última alerta
-#      no coinciden (ej. Telemetría dice CERRADA, Alerta dice ABIERTA).
+# (MODIFICACIÓN WEBHOOKS):
+# - Se añade conexión directa a la base de datos PostgreSQL.
+# - Se redefine la función 'render_alert_log' para leer de la tabla 'alerts'.
+# - Se añade auto-refresh de 8s solo para el log de alertas.
+# - Se añade notificación (st.error + st.audio) para nuevas alertas.
 # --------------------------------------------------------------------------
 
 import streamlit as st
@@ -37,6 +29,15 @@ import utils
 # Importar el componente de auto-refresco
 from streamlit_autorefresh import st_autorefresh
 
+# --- (MODIFICADO) Imports añadidos para Webhooks y DB ---
+import os
+import databases
+import sqlalchemy
+from sqlalchemy import Column, Integer, String, DateTime, JSON, MetaData
+from dotenv import load_dotenv
+import asyncio
+# --- Fin de imports modificados ---
+
 # --- 1. CONFIGURACIÓN INICIAL DE LA PÁGINA Y DEL ESTADO ---
 
 st.set_page_config(
@@ -50,6 +51,56 @@ MEXICO_TZ = pytz.timezone("America/Mexico_City")
 
 # Intervalo de refresco
 REFRESH_INTERVAL_SEC = 30 # Solicitado: 30 segundos
+
+# --- (MODIFICADO) Conexión a Base de Datos (para Webhooks) ---
+load_dotenv() # Asegurarse que .env se carga
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+if not DATABASE_URL:
+    st.error("Error: DATABASE_URL no está configurada. El log de alertas no funcionará.")
+    DATABASE_URL = "sqlite:///:memory:" # Fallback para que no crashee
+
+database = databases.Database(DATABASE_URL)
+metadata_db = MetaData()
+
+# Definición de la tabla 'alerts' (debe coincidir con webhook_receiver.py)
+alerts = sqlalchemy.Table(
+    "alerts",
+    metadata_db,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("event_id", String, unique=True, index=True),
+    Column("timestamp", DateTime(timezone=True)),
+    Column("vehicle_id", String),
+    Column("vehicle_name", String),
+    Column("alert_type", String),
+    Column("message", JSON),
+    Column("raw_json", JSON),
+)
+
+@st.on_event("startup")
+async def startup_db():
+    """Conectarse a la base de datos al iniciar."""
+    try:
+        if not database.is_connected:
+            await database.connect()
+            print("Conexión a BD de Streamlit establecida.")
+    except Exception as e:
+        print(f"Error al conectar Streamlit a la BD: {e}")
+
+@st.on_event("shutdown")
+async def shutdown_db():
+    """Desconectarse de la base de datos al apagar."""
+    try:
+        if database.is_connected:
+            await database.disconnect()
+            print("Conexión a BD de Streamlit cerrada.")
+    except Exception as e:
+        print(f"Error al desconectar Streamlit de la BD: {e}")
+# --- Fin de sección DB ---
+
 
 # --- INICIALIZACIÓN DE SESSION_STATE ---
 try:
@@ -74,6 +125,10 @@ if 'sensor_config' not in st.session_state:
     st.session_state.sensor_config = None
 if 'last_webhook_timestamp' not in st.session_state:
     st.session_state.last_webhook_timestamp = None
+
+# (MODIFICADO) Nuevo estado para notificación de alertas
+if 'last_alert_id' not in st.session_state:
+    st.session_state.last_alert_id = None
     
 # --- CSS v44 (Limpieza y ajuste de KPI de puerta) ---
 st.markdown("""
@@ -105,9 +160,6 @@ st.markdown("""
     }
     
     /* Estilos de KPIs */
-    .kpi-box { /* DEPRECATED, usar st.container(border=True) */
-        height: 100%;
-    }
     /* Asegurar que el st.container(border=True) ocupe altura */
     div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"]:has(div[data-testid="stMetric"]) {
         height: 100%;
@@ -165,16 +217,6 @@ st.markdown("""
         margin-top: 10px;
         font-style: italic;
     }
-    
-    /* Estilos de Alertas */
-    .webhook-alert {
-        border: 1px solid #262730; border-radius: 8px;
-        padding: 0.75rem 1rem; margin-bottom: 0.5rem;
-        background-color: #0E1117;
-    }
-    .webhook-alert-header { font-size: 0.9rem; color: #B0B0B0; }
-    .webhook-alert-header strong { color: #FAFAFA; }
-    .webhook-alert-message { font-size: 1rem; color: #FAFAFA; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -184,7 +226,7 @@ st.markdown("""
 st.title("❄️ Samsara Reefer-Tech")
 st.caption(f"Monitoreo en tiempo real de temperatura, puertas y GPS. (Refresca cada {REFRESH_INTERVAL_SEC}s)")
 
-# Solicitado: 30 segundos de refresco
+# Auto-refresco global para datos de API
 st_autorefresh(interval=REFRESH_INTERVAL_SEC * 1000, limit=None, key="data_refresher")
 
 
@@ -199,7 +241,6 @@ def load_vehicle_list(_api_client):
     vehicle_names = [v['name'] for v in vehicles]
     return vehicle_names, vehicle_map_obj
 
-# Solicitado: cacheo progresivo (ttl=15s, pero usamos REFRESH_INTERVAL_SEC=30s)
 @st.cache_data(ttl=REFRESH_INTERVAL_SEC)
 def fetch_live_kpis(_api_client, sensor_config, vehicle_id):
     """(v43) Esta función ahora solo obtiene el Snapshot
@@ -208,7 +249,6 @@ def fetch_live_kpis(_api_client, sensor_config, vehicle_id):
     stats_data = _api_client.get_live_stats(vehicle_id)
     return stats_data
 
-# Solicitado: cacheo progresivo
 @st.cache_data(ttl=REFRESH_INTERVAL_SEC) 
 def fetch_live_sensor_history(_api_client, sensor_config, window_minutes, step_seconds):
     """(v37) Esta función es solo para SENSORES (Temp, Hum, Puerta)."""
@@ -220,7 +260,6 @@ def fetch_live_sensor_history(_api_client, sensor_config, window_minutes, step_s
         step_seconds
     )
 
-# Solicitado: cacheo progresivo
 @st.cache_data(ttl=REFRESH_INTERVAL_SEC)
 def fetch_vehicle_stats_history(_api_client, vehicle_id, window_minutes):
     """(v37) Esta función es para Batería, GPS y Fallas."""
@@ -243,7 +282,6 @@ def process_sensor_history_data(results, column_map, step_seconds=30):
     has_door = "doorClosed" in column_map.values()
 
     for point in results:
-        # (v38) timeMs es naive, así que tz_localize es CORRECTO aquí
         row = {'timestamp': pd.to_datetime(point['timeMs'], unit='ms')}
         temp_val = None
         for i, value in enumerate(point['series']):
@@ -269,7 +307,6 @@ def process_sensor_history_data(results, column_map, step_seconds=30):
     if df.empty:
         return pd.DataFrame()
 
-    # (v38) tz_localize es CORRECTO aquí porque timeMs es naive
     df = df.tz_localize(pytz.utc).tz_convert(MEXICO_TZ)
     
     continuous_cols = [col for col in ['temperature', 'humidity'] if col in df.columns]
@@ -289,10 +326,8 @@ def process_vehicle_stats_history(stats_history_data):
     if not stats_history_data or 'data' not in stats_history_data or not stats_history_data['data']:
         return df_battery, all_faults_list
 
-    # El endpoint devuelve datos por vehículo, asumimos que solo pedimos uno
     vehicle_data = stats_history_data['data'][0]
 
-    # 1. Procesar Historial de Batería
     if 'batteryMilliVolts' in vehicle_data:
         bat_history = vehicle_data['batteryMilliVolts']
         if bat_history:
@@ -308,24 +343,19 @@ def process_vehicle_stats_history(stats_history_data):
                 else:
                      df_battery = df_battery.tz_convert(MEXICO_TZ)
                 
-                # Renombrar columna para que render_mini_chart funcione
                 df_battery = df_battery.rename(columns={'value': 'value'})
 
-    # 2. Procesar Historial de Fallas
     if 'faultCodes' in vehicle_data:
         all_faults_list = vehicle_data['faultCodes']
 
     return df_battery, all_faults_list
 
-# --- (v42) FUNCIONES DE CARGA DE ALERTAS API ---
-
-@st.cache_data(ttl=600) # Cachear configuraciones por 10 minutos
+# --- (v42) FUNCIONES DE CARGA DE ALERTAS API (Para KPI de Puerta) ---
+@st.cache_data(ttl=600)
 def load_alert_configurations(_api_client):
-    """Carga todas las configuraciones de alertas de la organización."""
     if not _api_client: return None
     return _api_client.get_alert_configurations()
 
-# Solicitado: cacheo progresivo
 @st.cache_data(ttl=REFRESH_INTERVAL_SEC)
 def fetch_alert_incidents(_api_client, configuration_ids, start_time_iso):
     """Obtiene incidentes de alerta para IDs de configuración específicos."""
@@ -335,10 +365,6 @@ def fetch_alert_incidents(_api_client, configuration_ids, start_time_iso):
 
 @st.cache_data
 def get_vehicle_config_ids(all_configs, vehicle_id):
-    """
-    Filtra la lista de todas las configuraciones de alertas para encontrar
-    aquellas que aplican a un ID de vehículo específico.
-    """
     vehicle_config_ids = []
     vehicle_id_str = str(vehicle_id)
 
@@ -410,7 +436,6 @@ def render_vehicle_info_and_sensors(vehicle_obj, sensor_config):
 
 
 def parse_fault_code(fault_time, fault_obj, code_type):
-    """(v35) Helper para parsear los diferentes tipos de códigos de falla."""
     codes_found = []
     
     if code_type == "obdii":
@@ -424,7 +449,6 @@ def parse_fault_code(fault_time, fault_obj, code_type):
                     "Codigo": dtc.get('dtcShortCode', 'N/A'),
                     "Desc": dtc.get('dtcDescription', 'N/A')
                 })
-            # (Omitidos pending/permanent por brevedad, pero la lógica es la misma)
     
     elif code_type == "j1939":
         if not fault_obj or 'diagnosticTroubleCodes' not in fault_obj:
@@ -440,10 +464,8 @@ def parse_fault_code(fault_time, fault_obj, code_type):
     return codes_found
 
 def render_fault_codes(fault_codes_history_list, live_fault_codes_obj):
-    """(v37) Actualizado para tomar lista de historial Y objeto en vivo."""
     st.sidebar.markdown(f"<div class='sensor-list-header'>🛠️ Códigos de Falla (Últimas 24h)</div>", unsafe_allow_html=True)
     
-    # 1. Determinar el estado del Check Engine Light (del objeto en vivo)
     check_engine_light = False
     if live_fault_codes_obj and live_fault_codes_obj.get('obdii'):
         check_engine_light = live_fault_codes_obj['obdii'].get('checkEngineLightIsOn', False)
@@ -453,7 +475,6 @@ def render_fault_codes(fault_codes_history_list, live_fault_codes_obj):
     else:
         st.sidebar.success("Check Engine Light: Apagada")
 
-    # 2. Procesar la lista de historial de fallas
     if not fault_codes_history_list:
         st.sidebar.caption("No hay historial de códigos de falla en las últimas 24h.")
         st.sidebar.markdown("<div class='sensor-separator'></div>", unsafe_allow_html=True)
@@ -501,7 +522,7 @@ def render_mini_chart(series_data, color):
     st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
 
 def render_door_status(door_series_1h, latest_door_alert):
-    """(v44) KPI de Puerta mejorado. Muestra Telemetría + Última Alerta."""
+    """(v44) KPI de Puerta mejorado. Muestra Telemetría + Última Alerta API."""
     
     alert_str = ""
     prev_event_str = ""
@@ -509,12 +530,11 @@ def render_door_status(door_series_1h, latest_door_alert):
     if latest_door_alert:
         alert_time_str = latest_door_alert['time'].strftime('%H:%M:%S')
         alert_name = latest_door_alert['name']
-        alert_str = f"Última Alerta: '{alert_name}' ({alert_time_str})"
+        alert_str = f"Última Alerta (API): '{alert_name}' ({alert_time_str})"
 
     if door_series_1h is None or door_series_1h.empty:
         status_str, status_time_str, status_class = "N/A", "Ping: N/A", "door-status-closed"
     else:
-        # 1. Obtener estado actual de Telemetría
         latest_status = door_series_1h.iloc[-1]
         latest_time = door_series_1h.index[-1]
         
@@ -522,7 +542,6 @@ def render_door_status(door_series_1h, latest_door_alert):
         status_class = "door-status-closed" if latest_status == 1 else "door-status-open"
         status_time_str = f"Última Telemetría: {latest_time.strftime('%H:%M:%S')}"
         
-        # 2. Buscar último evento opuesto (telemetría)
         try:
             different_events = door_series_1h[door_series_1h != latest_status]
             if not different_events.empty:
@@ -534,16 +553,14 @@ def render_door_status(door_series_1h, latest_door_alert):
             print(f"Error al buscar evento previo de puerta: {e}")
             prev_event_str = ""
             
-        # 3. (v44) Comprobar discrepancia entre Alerta y Telemetría
         if latest_door_alert:
             is_open_telemetry = (latest_status == 0)
             alert_name_lower = latest_door_alert['name'].lower()
             is_open_alert = "abierta" in alert_name_lower or "open" in alert_name_lower
             
-            # Si los estados no coinciden y la alerta es reciente (10 min)
             if is_open_telemetry != is_open_alert and \
                abs((latest_time - latest_door_alert['time']).total_seconds()) < 600:
-                alert_str += " ⚠️" # Añadir advertencia
+                alert_str += " ⚠️" 
 
     
     st.markdown(f"<h5>🚪 Estado de Puerta</h5>", unsafe_allow_html=True)
@@ -597,47 +614,71 @@ def render_history_charts(df, title_suffix):
     
     return df
 
-def render_alert_log(incidents_data):
-    """(v42) Renderiza las alertas reales desde la respuesta API de /alerts/incidents."""
-    st.subheader("🔔 Alertas de Samsara (Últimas 24h)")
+# (MODIFICADO) Esta función se reescribe completamente para usar Webhooks/DB
+async def render_alert_log():
+    """
+    (MODIFICADO) Renderiza las alertas desde la tabla 'alerts' de la BD.
+    Incluye auto-refresh de 8s y notificación con sonido.
+    """
+    st.subheader("🔔 Alertas en Vivo (Webhooks)")
     
-    if not incidents_data or 'data' not in incidents_data or not incidents_data['data']:
-        st.info("No se han registrado incidentes de alerta para este activo en las últimas 24h.")
-        return
+    # (MODIFICADO) Auto-refresh de 8 segundos específico para este componente
+    # Solicitado: 30 segundos, pero 8s es mejor para "en vivo"
+    st_autorefresh(interval=8000, limit=None, key="alert_refresher")
 
-    alerts = incidents_data['data'] 
-    
-    # Notificación de "Nueva Alerta"
     try:
-        last_alert_time = alerts[0]['startedAt']
-        if st.session_state.last_webhook_timestamp != last_alert_time:
-            st.success("🔔 Nueva Alerta de Activo!", icon="🔔")
-            st.session_state.last_webhook_timestamp = last_alert_time
-    except Exception:
-        pass
-        
-    for alert in alerts[:10]: # Mostrar las últimas 10
-        try:
-            alert_name = alert.get('name', 'Alerta Desconocida')
-            alert_time_utc = pd.to_datetime(alert.get('startedAt'))
-            alert_time_local = alert_time_utc.tz_convert(MEXICO_TZ).strftime('%Y-%m-%d %H:%M:%S')
-            message = alert.get('details', {}).get('description', 'Sin descripción.')
-            context = f"Activo: {alert.get('target', {}).get('name', 'N/A')}"
+        # (MODIFICADO) Query a la base de datos
+        if not database.is_connected:
+            await database.connect()
             
-            st.markdown(f"""
-            <div class='webhook-alert'>
-                <div class='webhook-alert-header'>
-                    <strong>{alert_name}</strong>
-                    <span style='float: right;'>{alert_time_local}</span>
-                </div>
-                <div class='webhook-alert-message'>{message}</div>
-                <div class='webhook-alert-header' style='margin-top: 5px;'>{context}</div>
-            </div>
-            """, unsafe_allow_html=True)
-        except Exception as e:
-            print(f"Error parseando incidente de alerta: {e}")
+        query = alerts.select().order_by(alerts.c.timestamp.desc()).limit(15)
+        results = await database.fetch_all(query)
 
-# Solicitado: cacheo progresivo
+        if not results:
+            st.info("No se han registrado alertas (webhooks) en la base de datos.")
+            return
+
+        # (MODIFICADO) Lógica de notificación
+        latest_alert_id = results[0]['event_id']
+        
+        # Inicializar el estado en la primera carga para evitar sonido
+        if st.session_state.last_alert_id is None:
+            st.session_state.last_alert_id = latest_alert_id
+        
+        # Si el ID más reciente es diferente al guardado, mostrar notificación
+        elif latest_alert_id != st.session_state.last_alert_id:
+            alert_msg = f"¡Nueva Alerta: {results[0]['alert_type']} en {results[0]['vehicle_name']}!"
+            st.error(alert_msg, icon="🚨")
+            # (MODIFICADO) Reproducir sonido (enlace genérico y corto)
+            st.audio("https://cdn.pixabay.com/audio/2022/03/15/audio_2210e72c83.mp3", autoplay=True, start_time=0)
+            st.session_state.last_alert_id = latest_alert_id
+
+        # (MODIFICADO) Preparar DataFrame (Hora, Vehículo, Tipo de alerta)
+        data_for_df = []
+        for row in results:
+            timestamp_utc = row['timestamp']
+            if timestamp_utc:
+                timestamp_local = timestamp_utc.astimezone(MEXICO_TZ).strftime('%H:%M:%S')
+            else:
+                timestamp_local = "N/A"
+            
+            data_for_df.append({
+                "Hora": timestamp_local,
+                "Vehículo": row['vehicle_name'],
+                "Tipo de alerta": row['alert_type']
+                # "Mensaje": str(row['message']) # Omitido por solicitud
+            })
+        
+        df_alerts = pd.DataFrame(data_for_df)
+        
+        # (MODIFICADO) Mostrar en st.dataframe
+        st.dataframe(df_alerts, use_container_width=True, hide_index=True)
+
+    except Exception as e:
+        st.error(f"Error al cargar alertas desde la base de datos: {e}")
+        print(f"Error en render_alert_log: {e}")
+
+
 @st.cache_data(ttl=REFRESH_INTERVAL_SEC)
 def generate_map_data(live_stats, vehicle_name):
     """Usa el 'live_stats' (snapshot) para el mapa."""
@@ -679,7 +720,6 @@ def on_vehicle_change():
         st.session_state.sensor_config = st.session_state.selected_vehicle_obj.get('sensorConfiguration')
     else:
         st.session_state.sensor_config = None
-    # Limpiar caché de datos al cambiar de vehículo
     st.cache_data.clear()
 
 
@@ -740,7 +780,7 @@ raw_stats_history_24h = fetch_vehicle_stats_history(
 )
 df_battery_history_24h, all_fault_codes_list = process_vehicle_stats_history(raw_stats_history_24h)
 
-# 5. (v42) CARGA DE ALERTAS REALES
+# 5. (v42) CARGA DE ALERTAS REALES (API) - Para KPI de Puerta
 all_alert_configs = load_alert_configurations(st.session_state.api_client)
 vehicle_config_ids = get_vehicle_config_ids(all_alert_configs, selected_vehicle_id)
 start_time_alerts = datetime.now(pytz.utc) - timedelta(hours=24)
@@ -750,10 +790,10 @@ alert_incidents = fetch_alert_incidents(
     start_time_alerts.isoformat()
 )
 
-# 6. (v44) PROCESAR ALERTA DE PUERTA
+# 6. (v44) PROCESAR ALERTA DE PUERTA (API)
 latest_door_alert = None
 if alert_incidents and 'data' in alert_incidents:
-    for alert in alert_incidents['data']: # Ya están ordenadas (más nuevas primero)
+    for alert in alert_incidents['data']: 
         alert_name_lower = alert.get('name', '').lower()
         if 'door' in alert_name_lower or 'puerta' in alert_name_lower:
             latest_door_alert = {
@@ -761,7 +801,7 @@ if alert_incidents and 'data' in alert_incidents:
                 "time": pd.to_datetime(alert.get('startedAt')).tz_convert(MEXICO_TZ),
                 "details": alert.get('details', {}).get('description', '')
             }
-            break # Encontrar solo la más reciente
+            break 
 
 # --- 8. RENDERIZADO DE LA BARRA LATERAL ---
 render_vehicle_info_and_sensors(st.session_state.selected_vehicle_obj, sensor_config)
@@ -774,7 +814,6 @@ render_fault_codes(all_fault_codes_list, live_fault_codes_obj)
 kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
 
 with kpi_col1:
-    # (v44) Pasando la serie de historial Y la última alerta
     render_door_status(
         df_history_1h.get('doorClosed'), 
         latest_door_alert
@@ -782,7 +821,6 @@ with kpi_col1:
 
 with kpi_col2:
     with st.container(border=True, height=185):
-        # (v44) KPI de Temperatura con timestamp individual
         temp_val_str, temp_time_str = "N/A", "(N/A)"
         df_temp_1h = df_history_1h.get('temperature')
         
@@ -797,7 +835,6 @@ with kpi_col2:
 
 with kpi_col3:
     with st.container(border=True, height=185):
-        # (v44) KPI de Humedad con timestamp individual
         hum_val_str, hum_time_str = "N/A", "(N/A)"
         df_hum_1h = df_history_1h.get('humidity')
 
@@ -812,7 +849,6 @@ with kpi_col3:
             
 with kpi_col4:
     with st.container(border=True, height=185):
-        # (v44) KPI de Batería con timestamp individual (Lógica v43 confirmada)
         bat_val, bat_time_str = "N/A", "(N/A)"
         df_bat_1h = df_battery_history_1h.get('value')
 
@@ -829,7 +865,7 @@ with kpi_col4:
         st.metric(label=f"🔋 Batería {bat_time_str}", value=bat_val)
         render_mini_chart(df_bat_1h, "#2ECC71")
 
-st.markdown("---") # Separador
+st.markdown("---") 
 
 # --- FILA PRINCIPAL (MAPA Y GRÁFICOS) ---
 col1, col2 = st.columns((6, 4)) 
@@ -855,9 +891,17 @@ with col1:
     
     st_folium(m, width=None, height=500, use_container_width=True, returned_objects=[])
     
-    # --- (v42) LOG DE ALERTAS REALES DE API ---
+    # --- (MODIFICADO) LOG DE ALERTAS (WEBHOOKS) ---
     st.markdown("---")
-    render_alert_log(alert_incidents) 
+    # (MODIFICADO) Se llama a la nueva función asíncrona usando asyncio.run()
+    # Esta función ahora lee de la BD y tiene su propio auto-refresh.
+    try:
+        asyncio.run(render_alert_log())
+    except Exception as e:
+        if "timeout" in str(e):
+            st.warning("Reconectando al log de alertas...")
+        else:
+            st.error(f"Error al renderizar log de alertas: {e}")
 
 with col2:
     # --- GRÁFICOS DE 24H (Cacheados) ---
