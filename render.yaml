@@ -1,0 +1,61 @@
+# --------------------------------------------------------------------------
+# render.yaml
+#
+# Manifiesto de despliegue para Render.com
+# Define 3 servicios:
+# 1. 'postgres-db': Una base de datos PostgreSQL gratuita.
+# 2. 'webhook-listener': El servicio web FastAPI (app.py).
+# 3. 'dashboard': El servicio web Streamlit (streamlit_app.py).
+# --------------------------------------------------------------------------
+
+services:
+  # 1. La Base de Datos PostgreSQL
+  - type: psql
+    name: postgres-db
+    plan: free # Plan gratuito de Render
+    # Render auto-provisionará 'DATABASE_URL'
+    # 'maxScale' 0 evita que se apague por inactividad
+    scaling:
+      minInstances: 1
+      maxInstances: 1
+      targetMemoryPercent: 60
+      targetCpuPercent: 60
+    autoSuspend: false
+    
+  # 2. El Listener de Webhooks (FastAPI)
+  - type: web
+    name: webhook-listener
+    plan: free # Plan gratuito
+    env: docker # Usar nuestro Dockerfile
+    autoSuspend: false # Mantener vivo para recibir webhooks
+    healthCheckPath: / # Comprobar que el servicio está vivo
+    envVars:
+      - key: DATABASE_URL
+        fromService:
+          type: psql
+          name: postgres-db
+          property: connectionString
+      - key: PYTHON_VERSION
+        value: 3.10.13
+    # Comando para iniciar este servicio
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+
+  # 3. El Dashboard (Streamlit)
+  - type: web
+    name: dashboard
+    plan: free # Plan gratuito
+    env: docker # Usar el MISMO Dockerfile
+    autoSuspend: false # Mantener vivo para acceso
+    healthCheckPath: /healthz # Endpoint de salud de Streamlit
+    envVars:
+      - key: DATABASE_URL
+        fromService:
+          type: psql
+          name: postgres-db
+          property: connectionString
+      - key: SAMSARA_API_KEY
+        sync: false # Poner este valor manualmente en el dashboard de Render
+      - key: PYTHON_VERSION
+        value: 3.10.13
+    # Comando para iniciar ESTE servicio
+    startCommand: streamlit run streamlit_app.py --server.port $PORT --server.enableCORS false --server.enableXsrfProtection false
