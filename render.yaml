@@ -1,3 +1,10 @@
+# --------------------------------------------------------------------------
+# render.yaml (MODO NATIVO DE PYTHON)
+#
+# CORRECCIÓN: 'startCommand' ahora usa '--port' (dos guiones)
+#             en lugar de '..port' (dos puntos).
+# --------------------------------------------------------------------------
+
 databases:
   - name: postgres-db
     plan: free
