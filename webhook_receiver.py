@@ -75,7 +75,8 @@ app = FastAPI(title="Samsara Webhook Listener")
 # --- Modelos Pydantic (Sin cambios) ---
 class WebhookPayload(BaseModel):
     eventId: str
-    eventTime: str
+    eventTime: Optional[str] = None  # <--- CAMBIO: AHORA ES OPCIONAL
+    eventMs: Optional[int] = None    # <--- AÑADIDO: Incluir eventMs, que suele venir
     eventType: str
     orgId: int
     webhookId: str
