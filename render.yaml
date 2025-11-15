@@ -1,49 +1,39 @@
 # --------------------------------------------------------------------------
-# render.yaml
+# render.yaml (Corregido v2)
 #
-# Manifiesto de despliegue para Render.com
-# Define 3 servicios:
-# 1. 'postgres-db': Una base de datos PostgreSQL gratuita.
-# 2. 'webhook-listener': El servicio web FastAPI (app.py).
-# 3. 'dashboard': El servicio web Streamlit (streamlit_app.py).
+# 1. CORREGIDO: 'databases' es una sección separada, no un 'type: psql'.
+# 2. CORREGIDO: El 'startCommand' de webhook-listener ahora apunta a
+#    'webhook_receiver:app' para coincidir con el nombre de tu archivo.
 # --------------------------------------------------------------------------
 
-services:
+databases:
   # 1. La Base de Datos PostgreSQL
-  - type: psql
-    name: postgres-db
-    plan: free # Plan gratuito de Render
-    # Render auto-provisionará 'DATABASE_URL'
-    # 'maxScale' 0 evita que se apague por inactividad
-    scaling:
-      minInstances: 1
-      maxInstances: 1
-      targetMemoryPercent: 60
-      targetCpuPercent: 60
-    autoSuspend: false
-    
+  - name: postgres-db
+    plan: free # Plan gratuito de Render. Nota: se suspenderá después de 90 días de inactividad.
+
+services:
   # 2. El Listener de Webhooks (FastAPI)
   - type: web
     name: webhook-listener
-    plan: free # Plan gratuito
+    plan: free
     env: docker # Usar nuestro Dockerfile
-    autoSuspend: false # Mantener vivo para recibir webhooks
+    autoSuspend: false # CRÍTICO: Mantener vivo para recibir webhooks
     healthCheckPath: / # Comprobar que el servicio está vivo
     envVars:
       - key: DATABASE_URL
         fromService:
           type: psql
           name: postgres-db
-          property: connectionString
+          property: connectionString # Hereda la URL de la BD
       - key: PYTHON_VERSION
-        value: 3.10.13
-    # Comando para iniciar este servicio
-    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+        value: "3.10.13"
+    # --- COMANDO CORREGIDO para coincidir con 'webhook_receiver.py' ---
+    startCommand: uvicorn webhook_receiver:app --host 0.0.0.0 --port $PORT
 
   # 3. El Dashboard (Streamlit)
   - type: web
     name: dashboard
-    plan: free # Plan gratuito
+    plan: free
     env: docker # Usar el MISMO Dockerfile
     autoSuspend: false # Mantener vivo para acceso
     healthCheckPath: /healthz # Endpoint de salud de Streamlit
@@ -52,10 +42,10 @@ services:
         fromService:
           type: psql
           name: postgres-db
-          property: connectionString
+          property: connectionString # Hereda la URL de la BD
       - key: SAMSARA_API_KEY
         sync: false # Poner este valor manualmente en el dashboard de Render
       - key: PYTHON_VERSION
-        value: 3.10.13
+        value: "3.10.13"
     # Comando para iniciar ESTE servicio
     startCommand: streamlit run streamlit_app.py --server.port $PORT --server.enableCORS false --server.enableXsrfProtection false
