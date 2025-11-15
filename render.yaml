@@ -1,54 +1,46 @@
 databases:
-
-name: samsara-db
-plan: free
-region: oregon
-postgresMajorVersion: 14
+  - name: samsara-db
+    plan: free
+    region: oregon
+    postgresMajorVersion: 15
 
 services:
+  # 1. FastAPI Webhook (nunca se duerme)
+  - type: web
+    name: samsara-webhook
+    env: python
+    pythonVersion: "3.10.13"
+    plan: free
+    region: oregon
+    autoSuspend: false
+    healthCheckPath: /docs
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn webhook_receiver:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: samsara-db
+          property: connectionString
+      - key: SAMSARA_WEBHOOK_SECRET
+        sync: false
+      - key: SAMSARA_API_KEY
+        sync: false
 
-type: web
-name: samsara-webhook
-env: python
-pythonVersion: "3.10.13"
-plan: free
-region: oregon
-autoSuspend: false
-healthCheckPath: /docs
-buildCommand: "pip install -r requirements.txt"
-startCommand: "uvicorn webhook_receiver:app --host 0.0.0.0 --port $PORT"
-routes:
-
-src: /webhook-samsara
-dest: /webhook
-envVars:
-
-key: DATABASE_URL
-fromService:
-type: postgres
-name: samsara-db
-property: connectionString
-
-key: SAMSARA_WEBHOOK_SECRET
-sync: false
-
-type: web
-name: samsara-dashboard
-env: python
-pythonVersion: "3.10.13"
-plan: free
-region: oregon
-autoSuspend: false
-healthCheckPath: /_stcore/health
-buildCommand: "pip install -r requirements.txt"
-startCommand: "streamlit run streamlit_app.py --server.port $PORT --server.enableCORS false --server.enableXsrfProtection false"
-envVars:
-
-key: DATABASE_URL
-fromService:
-type: postgres
-name: samsara-db
-property: connectionString
-
-key: SAMSARA_API_KEY
-sync: false
+  # 2. Dashboard Streamlit
+  - type: web
+    name: samsara-dashboard
+    env: python
+    pythonVersion: "3.10.13"
+    plan: free
+    region: oregon
+    autoSuspend: false
+    healthCheckPath: /_stcore/health
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run streamlit_app.py --server.port $PORT --server.enableCORS false --server.enableXsrfProtection false
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: samsara-db
+          property: connectionString
+      - key: SAMSARA_API_KEY
+        sync: false
