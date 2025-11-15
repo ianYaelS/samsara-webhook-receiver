@@ -1,54 +1,56 @@
 # --------------------------------------------------------------------------
-# render.yaml (MODO NATIVO DE PYTHON)
+# render.yaml (Python Nativo - Sin Docker)
 #
-# CORRECCIÓN: 'startCommand' ahora usa '--port' (dos guiones)
-#             en lugar de '..port' (dos puntos).
+# Define 3 servicios:
+# 1. Base de datos PostgreSQL gratuita.
+# 2. Servicio web "samsara-webhook" (FastAPI) para recibir webhooks.
+# 3. Servicio web "samsara-dashboard" (Streamlit) para visualización.
 # --------------------------------------------------------------------------
 
 databases:
-  - name: postgres-db
+  - name: samsara-db
     plan: free
     region: oregon
 
 services:
   # 1. El Listener de Webhooks (FastAPI)
   - type: web
-    name: webhook-listener
+    name: samsara-webhook
     env: python
     pythonVersion: "3.10.13"
     plan: free
     region: oregon
-    autoSuspend: false
-    healthCheckPath: /
+    autoSuspend: false # Es crucial para un webhook no suspenderse
+    healthCheckPath: /healthz # Endpoint de salud
     buildCommand: "pip install -r requirements.txt"
     startCommand: "uvicorn webhook_receiver:app --host 0.0.0.0 --port $PORT"
     envVars:
       - key: DATABASE_URL
         fromService:
           type: postgres
-          name: postgres-db
+          name: samsara-db
           property: connectionString
-      - key: PYTHON_VERSION
-        value: "3.10.13"
+      # ¡DEBES CONFIGURAR ESTO MANUALMENTE EN RENDER!
+      - key: SAMSARA_WEBHOOK_SECRET
+        sync: false # Poner el valor en el dashboard de Render
 
   # 2. El Dashboard (Streamlit)
   - type: web
-    name: dashboard
+    name: samsara-dashboard
     env: python
     pythonVersion: "3.10.13"
     plan: free
     region: oregon
-    autoSuspend: false
-    healthCheckPath: /_stcore/health
+    autoSuspend: false # Opcional, pero recomendado para un dashboard
+    healthCheckPath: /_stcore/health # Health check nativo de Streamlit
     buildCommand: "pip install -r requirements.txt"
     startCommand: "streamlit run streamlit_app.py --server.port $PORT --server.enableCORS false --server.enableXsrfProtection false"
     envVars:
       - key: DATABASE_URL
         fromService:
           type: postgres
-          name: postgres-db
+          name: samsara-db
           property: connectionString
+      # ¡DEBES CONFIGURAR ESTO MANUALMENTE EN RENDER!
       - key: SAMSARA_API_KEY
-        sync: false
-      - key: PYTHON_VERSION
-        value: "3.10.13"
+        sync: false # Poner el valor en el dashboard de Render
