@@ -1,10 +1,10 @@
 # --------------------------------------------------------------------------
-# render.yaml (Corregido v3)
+# render.yaml (Corregido v3.1 - Verificación final)
 #
-# 1. 'databases' es una sección separada (Correcto).
-# 2. 'startCommand' apunta a 'webhook_receiver:app' (Correcto).
-# 3. CORREGIDO: 'fromService.type' debe ser 'postgres', no 'psql'.
-# 4. AÑADIDO: 'region: oregon' para el plan gratuito.
+# 1. 'databases' está en su propia sección.
+# 2. 'fromService.type' es 'postgres'.
+# 3. 'startCommand' apunta a 'webhook_receiver:app'.
+# 4. 'region: oregon' está añadido para los planes gratuitos.
 # --------------------------------------------------------------------------
 
 databases:
@@ -25,7 +25,7 @@ services:
     envVars:
       - key: DATABASE_URL
         fromService:
-          type: postgres # <-- ¡ESTA ERA LA LÍNEA DEL ERROR!
+          type: postgres # <-- Corregido
           name: postgres-db
           property: connectionString # Hereda la URL de la BD
       - key: PYTHON_VERSION
@@ -44,7 +44,7 @@ services:
     envVars:
       - key: DATABASE_URL
         fromService:
-          type: postgres # <-- ¡ESTA ERA LA LÍNEA DEL ERROR!
+          type: postgres # <-- Corregido
           name: postgres-db
           property: connectionString # Hereda la URL de la BD
       - key: SAMSARA_API_KEY
