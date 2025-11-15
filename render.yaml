@@ -1,29 +1,59 @@
 # --------------------------------------------------------------------------
-# render.yaml (Corregido para UN solo servicio)
+# render.yaml (Corregido)
 #
-# Define un único "Web Service" usando Docker.
-# Esta NO es la sintaxis de "blueprint" (que usa 'services:'),
-# lo que evita el error 'autoSuspend not found'.
+# Esta es la configuración de "Blueprint" para MÚLTIPLES servicios.
+# 1. Define una base de datos PostgreSQL.
+# 2. Define el servicio "webhook-listener" (FastAPI).
+# 3. Define el servicio "dashboard" (Streamlit).
+#
+# EL ERROR ESTABA EN LA INDENTACIÓN:
+# 'autoSuspend', 'healthCheckPath', 'envVars', y 'startCommand'
+# deben estar al mismo nivel (con 2 espacios), como 'type', 'name', etc.
 # --------------------------------------------------------------------------
 
-type: web        # Tipo de servicio: Web Service
-name: samsara-app  # Nombre de tu aplicación
-env: docker      # Entorno: Docker
-plan: free       # Plan: Gratuito
-region: oregon   # Región
+databases:
+  # 1. La Base de Datos PostgreSQL
+  - name: postgres-db
+    plan: free
+    region: oregon
 
-# Desactiva la suspensión automática en el plan gratuito
-autoSuspend: false
+services:
+  # 2. El Listener de Webhooks (FastAPI)
+  - type: web
+    name: webhook-listener
+    plan: free
+    region: oregon
+    env: docker # Usar nuestro Dockerfile
+    # --- INDENTACIÓN CORREGIDA (2 ESPACIOS) ---
+    autoSuspend: false
+    healthCheckPath: /
+    envVars:
+      - key: DATABASE_URL
+        fromService:
+          type: postgres
+          name: postgres-db
+          property: connectionString
+      - key: PYTHON_VERSION
+        value: "3.10.13"
+    startCommand: uvicorn webhook_receiver:app --host 0.0.0.0 --port $PORT
 
-# Ruta para que Render verifique que tu app está viva
-healthCheckPath: /healthz
-
-# Variables de entorno
-envVars:
-  - key: PYTHON_VERSION
-    value: "3.10.13"
-  # Nota: No necesitamos DATABASE_URL aquí,
-  # ya que usaremos un archivo SQLite local.
-
-# El 'startCommand' se define dentro del Dockerfile (CMD).
-# No es necesario aquí.
+  # 3. El Dashboard (Streamlit)
+  - type: web
+    name: dashboard
+    plan: free
+    region: oregon
+    env: docker # Usar el MISMO Dockerfile
+    # --- INDENTACIÓN CORREGIDA (2 ESPACIOS) ---
+    autoSuspend: false
+    healthCheckPath: /_stcore/health # Health check específico de Streamlit
+    envVars:
+      - key: DATABASE_URL
+        fromService:
+          type: postgres
+          name: postgres-db
+          property: connectionString
+      - key: SAMSARA_API_KEY
+        sync: false # Poner este valor manualmente en el dashboard de Render
+      - key: PYTHON_VERSION
+        value: "3.10.13"
+    startCommand: streamlit run streamlit_app.py --server.port $PORT --server.enableCORS false --server.enableXsrfProtection false
