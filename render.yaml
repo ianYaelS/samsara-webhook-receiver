@@ -1,56 +1,54 @@
-# --------------------------------------------------------------------------
-# render.yaml (Python Nativo - Sin Docker)
-#
-# Define 3 servicios:
-# 1. Base de datos PostgreSQL gratuita.
-# 2. Servicio web "samsara-webhook" (FastAPI) para recibir webhooks.
-# 3. Servicio web "samsara-dashboard" (Streamlit) para visualización.
-# --------------------------------------------------------------------------
-
 databases:
-  - name: samsara-db
-    plan: free
-    region: oregon
+
+name: samsara-db
+plan: free
+region: oregon
+postgresMajorVersion: 14
 
 services:
-  # 1. El Listener de Webhooks (FastAPI)
-  - type: web
-    name: samsara-webhook
-    env: python
-    pythonVersion: "3.10.13"
-    plan: free
-    region: oregon
-    autoSuspend: false # Es crucial para un webhook no suspenderse
-    healthCheckPath: /healthz # Endpoint de salud
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn webhook_receiver:app --host 0.0.0.0 --port $PORT"
-    envVars:
-      - key: DATABASE_URL
-        fromService:
-          type: postgres
-          name: samsara-db
-          property: connectionString
-      # ¡DEBES CONFIGURAR ESTO MANUALMENTE EN RENDER!
-      - key: SAMSARA_WEBHOOK_SECRET
-        sync: false # Poner el valor en el dashboard de Render
 
-  # 2. El Dashboard (Streamlit)
-  - type: web
-    name: samsara-dashboard
-    env: python
-    pythonVersion: "3.10.13"
-    plan: free
-    region: oregon
-    autoSuspend: false # Opcional, pero recomendado para un dashboard
-    healthCheckPath: /_stcore/health # Health check nativo de Streamlit
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "streamlit run streamlit_app.py --server.port $PORT --server.enableCORS false --server.enableXsrfProtection false"
-    envVars:
-      - key: DATABASE_URL
-        fromService:
-          type: postgres
-          name: samsara-db
-          property: connectionString
-      # ¡DEBES CONFIGURAR ESTO MANUALMENTE EN RENDER!
-      - key: SAMSARA_API_KEY
-        sync: false # Poner el valor en el dashboard de Render
+type: web
+name: samsara-webhook
+env: python
+pythonVersion: "3.10.13"
+plan: free
+region: oregon
+autoSuspend: false
+healthCheckPath: /docs
+buildCommand: "pip install -r requirements.txt"
+startCommand: "uvicorn webhook_receiver:app --host 0.0.0.0 --port $PORT"
+routes:
+
+src: /webhook-samsara
+dest: /webhook
+envVars:
+
+key: DATABASE_URL
+fromService:
+type: postgres
+name: samsara-db
+property: connectionString
+
+key: SAMSARA_WEBHOOK_SECRET
+sync: false
+
+type: web
+name: samsara-dashboard
+env: python
+pythonVersion: "3.10.13"
+plan: free
+region: oregon
+autoSuspend: false
+healthCheckPath: /_stcore/health
+buildCommand: "pip install -r requirements.txt"
+startCommand: "streamlit run streamlit_app.py --server.port $PORT --server.enableCORS false --server.enableXsrfProtection false"
+envVars:
+
+key: DATABASE_URL
+fromService:
+type: postgres
+name: samsara-db
+property: connectionString
+
+key: SAMSARA_API_KEY
+sync: false
