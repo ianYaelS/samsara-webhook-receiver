@@ -10,9 +10,14 @@ COPY requirements.txt .
 # Instala las dependencias
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia todo el código de la aplicación
+# Copia todo el código de la aplicación (app.py, templates/, etc.)
 COPY . .
 
-# El 'CMD' será especificado en render.yaml, 
-# así que no necesitamos uno aquí.
-# Render usará $PORT automáticamente.
+# Expone el puerto que Render usará
+# Render proporciona la variable $PORT automáticamente
+EXPOSE $PORT
+
+# El comando para iniciar la aplicación
+# Usa gunicorn para producción
+# Escucha en 0.0.0.0 en el puerto $PORT que Render asigna
+CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:$PORT", "--workers", "4", "--timeout", "120"]
