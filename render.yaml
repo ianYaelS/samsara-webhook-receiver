@@ -9,7 +9,6 @@ services:
     plan: free
     region: oregon
     env: docker
-    autoSuspend: false
     healthCheckPath: /
     envVars:
       - key: DATABASE_URL
@@ -26,7 +25,6 @@ services:
     plan: free
     region: oregon
     env: docker
-    autoSuspend: false
     healthCheckPath: /_stcore/health
     envVars:
       - key: DATABASE_URL
