@@ -5,44 +5,42 @@ databases:
     postgresMajorVersion: "15"
 
 services:
-  # 1. FastAPI Webhook (nunca se duerme, recibe POSTs de Samsara)
+  # 1. Webhook FastAPI – RECOMENDADO PLAN STARTER PARA QUE NUNCA SE DUERMA
   - type: web
     name: samsara-webhook
     runtime: python
-    pythonVersion: "3.10.13"
-    plan: free
+    plan: starter   # <--- CAMBIA A starter ($7/mes) para que NO se duerma nunca
     region: oregon
-    autoSuspend: false
-    healthCheckPath: /docs
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn webhook_receiver:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /docs
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.10"
       - key: DATABASE_URL
         fromDatabase:
           name: samsara-db
           property: connectionString
       - key: SAMSARA_WEBHOOK_SECRET
-        sync: false
+        sync: false   # Render te pedirá el valor manual
       - key: SAMSARA_API_KEY
         sync: false
-    sync: false  # Para que te pida valores manuales en setup
 
-  # 2. Dashboard Streamlit (muestra alertas en vivo)
+  # 2. Dashboard Streamlit – free está perfecto
   - type: web
     name: samsara-dashboard
     runtime: python
-    pythonVersion: "3.10.13"
     plan: free
     region: oregon
-    autoSuspend: false
-    healthCheckPath: /_stcore/health
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run streamlit_app.py --server.port $PORT --server.enableCORS false --server.enableXsrfProtection false
+    healthCheckPath: /_stcore/health
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.10"
       - key: DATABASE_URL
         fromDatabase:
           name: samsara-db
           property: connectionString
       - key: SAMSARA_API_KEY
         sync: false
-    sync: false  # Para API key manual
