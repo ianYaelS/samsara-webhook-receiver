@@ -5,14 +5,13 @@
 #
 # 1. Recibe webhooks de Samsara en /webhook.
 # 2. Responde al 'Ping' de Samsara.
-# 3. (MODIFICADO) Verifica la firma 'X-Samsara-Signature'.
-# 4. (MODIFICADO) Guarda Alertas en la tabla 'alerts' de PostgreSQL.
+# 3. (CORREGIDO) Verifica la firma 'X-Samsara-Signature' decodificando el secreto Base64.
+# 4. Guarda Alertas en la tabla 'alerts' de PostgreSQL.
 # --------------------------------------------------------------------------
 
 import os
 import databases
 import sqlalchemy
-# (MODIFICADO) Imports añadidos para la nueva tabla y lógica de firma
 from sqlalchemy import Column, Integer, String, DateTime, JSON, MetaData
 from sqlalchemy.orm import sessionmaker
 from fastapi import FastAPI, Request, HTTPException, Response
@@ -21,10 +20,10 @@ from typing import Any, Dict, Optional
 import datetime
 import uvicorn
 import logging
-# (MODIFICADO) Imports añadidos para verificar la firma
 import hmac
 import hashlib
 import json
+import base64 # <-- IMPORTACIÓN AÑADIDA PARA DECODIFICAR
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -32,9 +31,7 @@ logger = logging.getLogger(__name__)
 
 # --- Configuración de la Base de Datos ---
 
-# Render.com proporciona esta variable de entorno automáticamente
 DATABASE_URL = os.getenv("DATABASE_URL")
-# (MODIFICADO) Se añade la variable de entorno para el secreto del webhook
 SAMSARA_WEBHOOK_SECRET = os.getenv("SAMSARA_WEBHOOK_SECRET")
 
 # Asegurarse de que la URL de Render (postgres://) funcione con sqlalchemy (postgresql://)
@@ -43,31 +40,37 @@ if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
 
 if not DATABASE_URL:
     logger.warning("ADVERTENCIA: DATABASE_URL no está configurada. Usando SQLite en memoria.")
-    DATABASE_URL = "sqlite:///:memory:" # Fallback para pruebas locales
+    DATABASE_URL = "sqlite:///:memory:" 
 
-# (MODIFICADO) Se añade la validación del secreto
 if not SAMSARA_WEBHOOK_SECRET:
     logger.error("ERROR FATAL: SAMSARA_WEBHOOK_SECRET no está configurado.")
-    # En un entorno real, podríamos querer que la app falle si esto no está.
-    # Por ahora, solo logueamos el error.
+
+# <-- INICIO DE CAMBIO CRÍTICO: DECODIFICACIÓN DEL SECRETO BASE64 -->
+# El secreto de Samsara está codificado en Base64 y debe ser decodificado.
+SECRET_BYTES = None
+if SAMSARA_WEBHOOK_SECRET:
+    try:
+        # Decodificar el secreto de Base64 a bytes (formato requerido por hmac.new)
+        SECRET_BYTES = base64.b64decode(SAMSARA_WEBHOOK_SECRET.encode('utf-8'))
+        logger.info("Secreto de Webhook decodificado con éxito.")
+    except Exception as e:
+        logger.error(f"Error al decodificar el secreto Base64: {e}")
+# <-- FIN DE CAMBIO CRÍTICO -->
+
 
 database = databases.Database(DATABASE_URL)
-# (MODIFICADO) Se cambia 'metadata' a 'MetaData()' para la nueva definición de tabla
 metadata = MetaData()
 
-# (MODIFICADO) Definición de la tabla 'alerts' (como se solicitó)
+# Definición de la tabla 'alerts' (como se solicitó)
 alerts = sqlalchemy.Table(
     "alerts",
     metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("event_id", String, unique=True, index=True),
-    # (MODIFICADO) Columna 'timestamp' de tipo DateTime con Timezone (TIMESTAMPZ)
     Column("timestamp", DateTime(timezone=True)),
     Column("vehicle_id", String),
     Column("vehicle_name", String),
-    # (MODIFICADO) 'alert_type' almacenará la descripción (ej. "Gateway Unplugged")
     Column("alert_type", String),
-    # (MODIFICADO) 'message' almacenará el JSON de 'details'
     Column("message", JSON),
     Column("raw_json", JSON),
 )
@@ -93,22 +96,24 @@ class WebhookPayload(BaseModel):
     eventType: str
     orgId: int
     webhookId: str
-    data: Optional[Dict[str, Any]] = None # Para AlertIncident
-    event: Optional[Dict[str, Any]] = None # Para Ping
+    data: Optional[Dict[str, Any]] = None 
+    event: Optional[Dict[str, Any]] = None 
 
-# --- (MODIFICADO) Función de Verificación de Firma ---
+# --- Función de Verificación de Firma (MODIFICADA) ---
 
-async def verify_signature(body: bytes, signature_header: str, secret: str):
+async def verify_signature(body: bytes, signature_header: str): # Removido 'secret'
     """
-    Verifica la firma v1 de Samsara.
+    Verifica la firma v1 de Samsara usando el secreto decodificado global.
     """
+    global SECRET_BYTES
+    
     if not signature_header:
         logger.warning("Firma no encontrada en la cabecera.")
         return False
         
-    if not secret:
-        logger.error("SAMSARA_WEBHOOK_SECRET no está configurado. No se puede verificar la firma.")
-        # Permitir pasar si el secreto no está configurado (para pruebas locales)
+    if SECRET_BYTES is None: # Usa SECRET_BYTES
+        logger.error("SECRET_BYTES no configurado o decodificado. No se puede verificar la firma.")
+        # Permitir pasar si el secreto no está configurado (solo para pruebas sin secreto)
         return True 
 
     try:
@@ -124,10 +129,17 @@ async def verify_signature(body: bytes, signature_header: str, secret: str):
             logger.warning("Firma v1 no encontrada en la cabecera.")
             return False
 
-        # Calcular nuestro hash
+        # Extraer el X-Samsara-Timestamp
+        timestamp = request.headers['X-Samsara-Timestamp'] # Se requiere el objeto request
+        
+        # Preparar el mensaje para firmar: v1:<timestamp>:<body>
+        prefix = bytes('v1:' + timestamp + ':', 'utf-8')
+        message = prefix + body
+        
+        # Calcular nuestro hash usando el secreto decodificado
         computed_hash = hmac.new(
-            secret.encode(),
-            body,
+            SECRET_BYTES, # <-- USA EL VALOR DECODIFICADO
+            message,
             hashlib.sha256
         ).hexdigest()
 
@@ -160,27 +172,34 @@ def read_root():
     """Endpoint raíz para verificar que el servicio está vivo."""
     return {"status": "Samsara Webhook Listener está en línea."}
 
-# (MODIFICADO) El endpoint ahora usa 'Request' para leer el body crudo
+# El endpoint ahora usa 'Request' para leer el body crudo
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     """
     Endpoint principal para recibir todos los webhooks de Samsara.
-    (MODIFICADO) Ahora verifica la firma y guarda en la tabla 'alerts'.
+    Ahora verifica la firma y guarda en la tabla 'alerts'.
     """
 
-    # (MODIFICADO) 1. Leer body crudo y verificar firma
+    # 1. Leer body crudo y verificar firma
     raw_body = await request.body()
     signature_header = request.headers.get('x-samsara-signature')
+    
+    # Se debe verificar el timestamp *antes* de la firma
+    timestamp_header = request.headers.get('x-samsara-timestamp')
+    if not timestamp_header:
+         logger.error("Falta X-Samsara-Timestamp. Rechazando.")
+         raise HTTPException(status_code=400, detail="Falta el encabezado de tiempo.")
 
-    if not await verify_signature(raw_body, signature_header, SAMSARA_WEBHOOK_SECRET):
-        # (MODIFICADO) Si el secreto está configurado y la firma falla, rechazar
-        if SAMSARA_WEBHOOK_SECRET:
+
+    if not await verify_signature(raw_body, signature_header):
+        # Si el secreto está configurado y la firma falla, rechazar
+        if SECRET_BYTES: # Usa SECRET_BYTES
              logger.error("¡FALLO DE VERIFICACIÓN DE FIRMA!")
              raise HTTPException(status_code=403, detail="Firma inválida.")
         else:
-             logger.warning("Firma no verificada (SAMSARA_WEBHOOK_SECRET no configurado).")
+             logger.warning("Firma no verificada (SECRET_BYTES no configurado).")
 
-    # (MODIFICADO) 2. Parsear el payload (ahora que el body crudo fue leído)
+    # 2. Parsear el payload (ahora que el body crudo fue leído y verificado)
     try:
         payload_dict = json.loads(raw_body)
         payload = WebhookPayload(**payload_dict)
@@ -194,7 +213,6 @@ async def receive_webhook(request: Request):
     # 3. Manejar el 'Ping' de Samsara
     if payload.eventType == "Ping":
         logger.info("Ping de Samsara recibido. ¡La conexión funciona!")
-        # (MODIFICADO) Devolver 200 OK con body (como se solicitó)
         return {"status": "success", "ping_received": True}
 
     # 4. Manejar 'AlertIncident'
@@ -207,15 +225,12 @@ async def receive_webhook(request: Request):
                 logger.warning("Alerta recibida pero sin 'conditions'. Omitiendo.")
                 return {"status": "success", "alert_ignored": "no_conditions"}
 
-            # Extraer info del primer 'condition'
             first_condition = conditions[0]
             
-            # (MODIFICADO) Extraer campos según lo solicitado
-            description = first_condition.get("description", "Sin descripción") # -> alert_type
-            details = first_condition.get("details", {}) # -> message (JSON)
-            happened_at_time = alert_data.get("happenedAtTime") # -> timestamp
+            description = first_condition.get("description", "Sin descripción") 
+            details = first_condition.get("details", {}) 
+            happened_at_time = alert_data.get("happenedAtTime") 
             
-            # Intentar obtener info del vehículo (lógica existente)
             vehicle_name = "N/A"
             vehicle_id = "N/A"
             
@@ -224,7 +239,6 @@ async def receive_webhook(request: Request):
                 vehicle_name = gateway_info["vehicle"].get("name", "N/A")
                 vehicle_id = gateway_info["vehicle"].get("id", "N/A")
 
-            # (MODIFICADO) Preparar datos para la tabla 'alerts'
             event_to_store = {
                 "event_id": payload.eventId,
                 "timestamp": happened_at_time,
@@ -232,16 +246,14 @@ async def receive_webhook(request: Request):
                 "message": details,
                 "vehicle_name": vehicle_name,
                 "vehicle_id": vehicle_id,
-                "raw_json": payload.dict() # Guardar todo el payload
+                "raw_json": payload.dict() 
             }
             
             logger.info(f"Insertando Alerta: {description} para {vehicle_name}")
             
-            # (MODIFICADO) Insertar en la tabla 'alerts'
             query = alerts.insert().values(event_to_store)
             await database.execute(query)
 
-            # (MODIFICADO) Devolver 200 OK con body (como se solicitó)
             return {"status": "success", "data_received": True}
 
         except Exception as e:
@@ -249,10 +261,8 @@ async def receive_webhook(request: Request):
             raise HTTPException(status_code=500, detail=f"Error al procesar: {e}")
 
     logger.info(f"Evento no manejado: {payload.eventType}")
-    # (MODIFICADO) Devolver 200 OK con body (como se solicitó)
     return {"status": "success", "event_type_unhandled": payload.eventType}
 
 # --- Para ejecutar localmente ---
 if __name__ == "__main__":
-    # Uvicorn se ejecutará en el puerto 8000 localmente
     uvicorn.run(app, host="0.0.0.0", port=8000)
