@@ -1,12 +1,12 @@
 # --------------------------------------------------------------------------
 # webhook_receiver.py
 #
-# Servidor de Webhooks (FastAPI) - CORRECCIÓN DEFINITIVA DE FIRMA
+# Servidor de Webhooks (FastAPI) - FINAL
 #
-# 1. Recibe webhooks de Samsara en /webhook.
-# 2. Responde al 'Ping' de Samsara.
-# 3. (CORREGIDO) Verifica la firma, pasando el objeto 'request' a la función de verificación.
-# 4. Guarda Alertas en la tabla 'alerts' de PostgreSQL.
+# - Incluye fix de decodificación Base64 para X-Samsara-Signature.
+# - Incluye fix de Pydantic (eventTime optional).
+# - Incluye Fallback de DB a SQLite (alerts.db) para desarrollo local.
+# - FIX CRÍTICO: Conversión de string ISO a datetime para inserción en DB.
 # --------------------------------------------------------------------------
 
 import os
@@ -21,6 +21,7 @@ import hmac
 import hashlib
 import json
 import base64 
+from datetime import datetime # <-- IMPORTACIÓN CLAVE
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -31,12 +32,14 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv("DATABASE_URL")
 SAMSARA_WEBHOOK_SECRET = os.getenv("SAMSARA_WEBHOOK_SECRET")
 
+# Asegurarse de que la URL de Render (postgres://) funcione con sqlalchemy (postgresql://)
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+# ROBUSTEZ LOCAL: Si DATABASE_URL no existe (modo dev), usar SQLite persistente.
 if not DATABASE_URL:
-    logger.warning("ADVERTENCIA: DATABASE_URL no está configurada. Usando SQLite en memoria.")
-    DATABASE_URL = "sqlite:///:memory:" 
+    logger.warning("ADVERTENCIA: DATABASE_URL no configurada. Usando SQLite local (alerts.db).")
+    DATABASE_URL = "sqlite:///alerts.db" 
 
 if not SAMSARA_WEBHOOK_SECRET:
     logger.error("ERROR FATAL: SAMSARA_WEBHOOK_SECRET no está configurado.")
@@ -45,6 +48,7 @@ if not SAMSARA_WEBHOOK_SECRET:
 SECRET_BYTES = None
 if SAMSARA_WEBHOOK_SECRET:
     try:
+        # Decodificar el secreto de Base64 a bytes (formato requerido por hmac.new)
         SECRET_BYTES = base64.b64decode(SAMSARA_WEBHOOK_SECRET.encode('utf-8'))
         logger.info("Secreto de Webhook decodificado con éxito.")
     except Exception as e:
@@ -68,22 +72,26 @@ alerts = sqlalchemy.Table(
 )
 
 engine = sqlalchemy.create_engine(DATABASE_URL)
-metadata.create_all(engine)
+try:
+    metadata.create_all(engine)
+except Exception as e:
+    logger.warning(f"No se pudo crear la tabla (posiblemente PostgreSQL). Error: {e}")
+
 
 app = FastAPI(title="Samsara Webhook Listener")
 
-# --- Modelos Pydantic (Sin cambios) ---
+# --- Modelos Pydantic ---
 class WebhookPayload(BaseModel):
     eventId: str
-    eventTime: Optional[str] = None  # <--- CAMBIO: AHORA ES OPCIONAL
-    eventMs: Optional[int] = None    # <--- AÑADIDO: Incluir eventMs, que suele venir
+    eventTime: Optional[str] = None  # FIX: Ahora opcional para evitar errores 400
+    eventMs: Optional[int] = None    # Incluir por si viene en milisegundos
     eventType: str
     orgId: int
     webhookId: str
     data: Optional[Dict[str, Any]] = None 
     event: Optional[Dict[str, Any]] = None 
 
-# --- Función de Verificación de Firma (CORREGIDA) ---
+# --- Función de Verificación de Firma ---
 
 async def verify_signature(request: Request, body: bytes): 
     """
@@ -93,7 +101,7 @@ async def verify_signature(request: Request, body: bytes):
     global SECRET_BYTES
     
     if SECRET_BYTES is None: 
-        logger.error("SECRET_BYTES no configurado. Permitiendo el paso (solo para desarrollo).")
+        logger.error("SECRET_BYTES no configurado. Permitiendo el paso (solo para desarrollo sin secreto).")
         return True 
 
     # 1. Extraer Headers requeridos (Timestamp y Signature)
@@ -128,14 +136,14 @@ async def verify_signature(request: Request, body: bytes):
     ).hexdigest()
 
     # 5. Comparar de forma segura (v1 hash vs hash calculado)
-    # Comparamos solo los valores hexadecimales
     return hmac.compare_digest(v1_hash, computed_hash)
 
 
-# --- Funciones de la App (MODIFICADO: Llamada a verify_signature) ---
+# --- Funciones de la App ---
 
 @app.on_event("startup")
 async def startup():
+    """Conectarse a la base de datos al iniciar."""
     try:
         await database.connect()
         logger.info(f"Conectado a la base de datos: {DATABASE_URL.split('@')[-1]}")
@@ -144,11 +152,13 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
+    """Desconectarse de la base de datos al apagar."""
     await database.disconnect()
     logger.info("Desconectado de la base de datos.")
 
 @app.get("/")
 def read_root():
+    """Endpoint raíz para verificar que el servicio está vivo."""
     return {"status": "Samsara Webhook Listener está en línea."}
 
 @app.post("/webhook")
@@ -160,7 +170,7 @@ async def receive_webhook(request: Request):
     # 1. Leer body crudo 
     raw_body = await request.body()
     
-    # 2. Verificar firma (Pasamos el objeto request)
+    # 2. Verificar firma 
     if not await verify_signature(request, raw_body):
         # Si el secreto está configurado y la firma falla, rechazar
         if SECRET_BYTES: 
@@ -183,7 +193,6 @@ async def receive_webhook(request: Request):
     # 4. Manejar el 'Ping' de Samsara
     if payload.eventType == "Ping":
         logger.info("Ping de Samsara recibido. ¡La conexión funciona!")
-        # Debe retornar 200 OK
         return {"status": "success", "ping_received": True}
 
     # 5. Manejar 'AlertIncident'
@@ -200,7 +209,13 @@ async def receive_webhook(request: Request):
             
             description = first_condition.get("description", "Sin descripción") 
             details = first_condition.get("details", {}) 
-            happened_at_time = alert_data.get("happenedAtTime") 
+            happened_at_time_str = alert_data.get("happenedAtTime") # <-- Se extrae como string
+
+            # --- FIX CRÍTICO: CONVERTIR STRING ISO A DATETIME ---
+            happened_at_time_dt = None
+            if happened_at_time_str:
+                # El formato de Samsara es ISO con Z (UTC). fromisoformat lo maneja.
+                happened_at_time_dt = datetime.fromisoformat(happened_at_time_str.replace('Z', '+00:00'))
             
             # Lógica para obtener Vehicle Name/ID
             vehicle_name = "N/A"
@@ -213,7 +228,8 @@ async def receive_webhook(request: Request):
 
             event_to_store = {
                 "event_id": payload.eventId,
-                "timestamp": happened_at_time,
+                # <-- USAMOS EL OBJETO DATETIME CONVERTIDO -->
+                "timestamp": happened_at_time_dt, 
                 "alert_type": description,
                 "message": details,
                 "vehicle_name": vehicle_name,
@@ -226,10 +242,12 @@ async def receive_webhook(request: Request):
             query = alerts.insert().values(event_to_store)
             await database.execute(query)
 
+            # Éxito: Devolver 200 OK
             return {"status": "success", "data_received": True}
 
         except Exception as e:
             logger.error(f"Error al procesar AlertIncident: {e}")
+            # Devolver 500 para indicarle a Samsara que el error fue interno (la base de datos)
             raise HTTPException(status_code=500, detail=f"Error al procesar: {e}")
 
     logger.info(f"Evento no manejado: {payload.eventType}")
