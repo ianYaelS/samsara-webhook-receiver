@@ -4,12 +4,17 @@ databases:
     region: oregon
 
 services:
+  # 1. El Listener de Webhooks (FastAPI)
   - type: web
     name: webhook-listener
+    env: python
+    pythonVersion: "3.10.13"
     plan: free
     region: oregon
-    env: docker
+    autoSuspend: false
     healthCheckPath: /
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn webhook_receiver:app --host 0.0.0.0 --port $PORT"
     envVars:
       - key: DATABASE_URL
         fromService:
@@ -18,14 +23,18 @@ services:
           property: connectionString
       - key: PYTHON_VERSION
         value: "3.10.13"
-    startCommand: uvicorn webhook_receiver:app --host 0.0.0.0 --port $PORT
 
+  # 2. El Dashboard (Streamlit)
   - type: web
     name: dashboard
+    env: python
+    pythonVersion: "3.10.13"
     plan: free
     region: oregon
-    env: docker
+    autoSuspend: false
     healthCheckPath: /_stcore/health
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "streamlit run streamlit_app.py --server.port $PORT --server.enableCORS false --server.enableXsrfProtection false"
     envVars:
       - key: DATABASE_URL
         fromService:
@@ -33,7 +42,6 @@ services:
           name: postgres-db
           property: connectionString
       - key: SAMSARA_API_KEY
-        sync: false
+        sync: false # Recuerda poner esta clave manualmente en el dashboard de Render
       - key: PYTHON_VERSION
         value: "3.10.13"
-    startCommand: streamlit run streamlit_app.py --server.port $PORT --server.enableCORS false --server.enableXsrfProtection false
