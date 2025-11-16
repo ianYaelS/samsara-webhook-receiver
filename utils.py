@@ -4,13 +4,14 @@
 # Lógica de Backend, Cliente de API de Samsara e IA.
 #
 # v73 (Mapeo de Respaldo)
+# - (CORRECCIÓN): Arreglado un 'SyntaxError' en la función '_make_request'.
 # - (NUEVO) Añadido 'MANUAL_DRIVER_FALLBACK_MAP'.
 #   Esto soluciona el problema de que la API de Samsara
 #   reporte 'driver=None' para un vehículo, aunque el conductor
 #   esté enviando formularios. Esto fuerza la conexión en el dashboard.
 #
 # v71 (Soporte de Conductor)
-# - (MODIFICADO) 'get_vehicles': Ahora usa 'include=driver'.
+# - 'get_vehicles': Ahora usa 'include=driver'.
 # --------------------------------------------------------------------------
 
 import requests
@@ -52,15 +53,62 @@ MANUAL_DRIVER_FALLBACK_MAP = {
 
 class SamsaraAPIClient:
     def __init__(self, api_key):
-# ... existing code ...
+        self.api_key = api_key
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        self.v1_headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Api-Key": self.api_key
+        }
+        
+        # (v44) Configuración de Sesión y Reintentos
+        self.session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "POST"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
         
         print(f"Cliente de API inicializado con reintentos (3x).")
 
+    # --- (CORREGIDO v73) ---
     def _make_request(self, endpoint, method="GET", params=None, json_data=None, is_v1=False):
-# ... existing code ...
+        """Helper function to make API requests with error handling and retries."""
+        url = f"{SAMSARA_API_URL}{endpoint}"
+        headers_to_use = self.v1_headers if is_v1 else self.headers
+        
+        try:
+            response = self.session.request(
+                method=method.upper(),
+                url=url,
+                headers=headers_to_use,
+                params=params,
+                json=json_data,
+                timeout=10 # 10 segundos de timeout
+            )
+            response.raise_for_status() # Lanza un error para códigos 4xx/5xx
+            return response.json()
+        
+        # --- (INICIO DE BLOQUE CORREGIDO) ---
+        # El bloque 'except' estaba malformado y causaba el SyntaxError.
+        # Ahora está correctamente anidado dentro de la función.
+        except requests.exceptions.HTTPError as http_err:
+            print(f"Error HTTP (después de reintentos): {http_err} - {http_err.response.text}")
+        except requests.exceptions.RequestException as req_err:
+            print(f"Error de Petición (después de reintentos): {req_err}")
         except Exception as e:
             print(f"Error inesperado en la petición de API: {e}")
+        # --- (FIN DE BLOQUE CORREGIDO) ---
+        
         return None
 
     # --- (MODIFICADO v73) ---
