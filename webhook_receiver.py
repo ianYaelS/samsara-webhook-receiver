@@ -1,14 +1,15 @@
 # --------------------------------------------------------------------------
 # webhook_receiver.py
 #
-# Servidor de Webhooks (FastAPI) - v67 (Lógica v66 confirmada)
+# Servidor de Webhooks (FastAPI) - v71
 #
-# - (v66): Modificada la lógica de 'AlertIncident' (Form Submitted):
-#   - La 'Referencia' (vehicle_name) ahora es el 'driver_id' (ej. "54432217")
-#     en lugar de "Form Submitted by: ID".
-# - (v65): Añadida columna 'incident_url' a la base de datos.
-# - (v65): Refactorizada la lógica de 'AlertIncident' para manejar
-#   múltiples tipos de alertas y almacenar 'incidentUrl'.
+# - (FIX v71): Corregida la lógica de parseo de 'AlertIncident'.
+#   - El 'vehicle_id' (para filtrar) ahora se busca en *todas* las
+#     alertas, incluido el objeto 'details.vehicle' en los formularios.
+#   - El 'vehicle_name' (Referencia) es el 'driver_id' para Formularios
+#     y el 'vehicle_name' para otras alertas.
+#   - SI Y SOLO SI no se encuentra un 'vehicle_id' en un formulario,
+#     se usará el 'driver_id' como 'vehicle_id' de respaldo.
 # --------------------------------------------------------------------------
 
 import os
@@ -68,21 +69,19 @@ alerts = sqlalchemy.Table(
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("event_id", String, unique=True, index=True),
     Column("timestamp", DateTime(timezone=True)),
-    Column("vehicle_id", String),
-    Column("vehicle_name", String), # <--- Esta columna ahora es "Referencia"
+    Column("vehicle_id", String), # (v71) ID del Vehículo (o Driver ID si no hay vehículo)
+    Column("vehicle_name", String), # "Referencia" (Nombre Vehículo o ID Conductor)
     Column("alert_type", String),
     Column("message", JSON),
-    Column("incident_url", String, nullable=True), # <--- NUEVA COLUMNA
+    Column("incident_url", String, nullable=True),
     Column("raw_json", JSON),
 )
 
 engine = sqlalchemy.create_engine(DATABASE_URL)
 try:
-    # Intenta crear la tabla (necesario para SQLite local, ignorado por Render/PostgreSQL si ya existe)
     metadata.create_all(engine)
     logger.info("Verificación/creación de tabla 'alerts' completada.")
 except Exception as e:
-    # Esto es común en Render, donde el motor no tiene permisos de DDL después del build
     logger.warning(f"No se pudo asegurar la creación de la tabla (posiblemente PostgreSQL). Error: {e}")
 
 
@@ -91,8 +90,8 @@ app = FastAPI(title="Samsara Webhook Listener")
 # --- Modelos Pydantic ---
 class WebhookPayload(BaseModel):
     eventId: str
-    eventTime: Optional[str] = None  # FIX: Ahora opcional para evitar errores 400
-    eventMs: Optional[int] = None    # Incluir por si viene en milisegundos
+    eventTime: Optional[str] = None
+    eventMs: Optional[int] = None
     eventType: str
     orgId: int
     webhookId: str
@@ -112,7 +111,6 @@ async def verify_signature(request: Request, body: bytes):
         logger.error("SECRET_BYTES no configurado. Permitiendo el paso (solo para desarrollo sin secreto).")
         return True 
 
-    # 1. Extraer Headers requeridos (Timestamp y Signature)
     try:
         timestamp = request.headers['x-samsara-timestamp']
         signature_header = request.headers['x-samsara-signature']
@@ -120,7 +118,6 @@ async def verify_signature(request: Request, body: bytes):
         logger.warning(f"Falta el encabezado requerido: {e}")
         return False
 
-    # 2. Extraer el hash v1
     v1_hash = None
     parts = signature_header.split(',')
     for part in parts:
@@ -132,18 +129,15 @@ async def verify_signature(request: Request, body: bytes):
         logger.warning("Firma v1 no encontrada en la cabecera.")
         return False
 
-    # 3. Preparar el mensaje para firmar: v1:<timestamp>:<body>
     prefix = bytes('v1:' + timestamp + ':', 'utf-8')
     message = prefix + body
     
-    # 4. Calcular nuestro hash usando el secreto decodificado
     computed_hash = hmac.new(
         SECRET_BYTES,
         message,
         hashlib.sha256
     ).hexdigest()
 
-    # 5. Comparar de forma segura (v1 hash vs hash calculado)
     return hmac.compare_digest(v1_hash, computed_hash)
 
 
@@ -151,23 +145,16 @@ async def verify_signature(request: Request, body: bytes):
 
 @app.on_event("startup")
 async def startup():
-    """Conectarse a la base de datos al iniciar."""
-    try:
-        await database.connect()
-        # Muestra la conexión que se está usando para confirmar el éxito.
-        logger.info(f"Conectado a la base de datos (PostgreSQL): {DATABASE_URL.split('@')[-1]}")
-    except Exception as e:
-        logger.error(f"Error al conectar a la base de datos: {e}")
+    await database.connect()
+    logger.info(f"Conectado a la base de datos (PostgreSQL): {DATABASE_URL.split('@')[-1]}")
 
 @app.on_event("shutdown")
 async def shutdown():
-    """Desconectarse de la base de datos al apagar."""
     await database.disconnect()
     logger.info("Desconectado de la base de datos.")
 
 @app.get("/")
 def read_root():
-    """Endpoint raíz para verificar que el servicio está vivo."""
     return {"status": "Samsara Webhook Listener está en línea."}
 
 @app.post("/webhook")
@@ -175,20 +162,15 @@ async def receive_webhook(request: Request):
     """
     Endpoint principal para recibir todos los webhooks de Samsara.
     """
-
-    # 1. Leer body crudo 
     raw_body = await request.body()
     
-    # 2. Verificar firma 
     if not await verify_signature(request, raw_body):
-        # Si el secreto está configurado y la firma falla, rechazar
         if SECRET_BYTES: 
              logger.error("¡FALLO DE VERIFICACIÓN DE FIRMA!")
              raise HTTPException(status_code=403, detail="Firma inválida.")
         else:
              logger.warning("Firma no verificada (SECRET_BYTES no configurado).")
 
-    # 3. Parsear el payload 
     try:
         payload_dict = json.loads(raw_body)
         payload = WebhookPayload(**payload_dict)
@@ -199,12 +181,11 @@ async def receive_webhook(request: Request):
     
     logger.info(f"===== WEBHOOK DE SAMSARA RECIBIDO ({payload.eventType}) =====")
 
-    # 4. Manejar el 'Ping' de Samsara
     if payload.eventType == "Ping":
         logger.info("Ping de Samsara recibido. ¡La conexión funciona!")
         return {"status": "success", "ping_received": True}
 
-    # 5. Manejar 'AlertIncident' (MODIFICADO v65/v66)
+    # --- (MODIFICADO v71) ---
     if payload.eventType == "AlertIncident" and payload.data:
         try:
             alert_data = payload.data
@@ -219,10 +200,9 @@ async def receive_webhook(request: Request):
             # --- Variables a popular ---
             alert_type_str = first_condition.get("description", "Alerta Desconocida") 
             details = first_condition.get("details", {}) 
-            vehicle_name_str = "N/A" # Esta es la "Referencia"
-            vehicle_id_str = "N/A"
-            # Esta es la línea clave: extrae 'incidentUrl' del payload 'data'
-            incident_url_str = alert_data.get("incidentUrl") 
+            vehicle_name_str = "N/A" # "Referencia"
+            vehicle_id_str = "N/A"   # "ID de Filtro"
+            incident_url_str = alert_data.get("incidentUrl")
             # ---
 
             happened_at_time_str = alert_data.get("happenedAtTime")
@@ -230,12 +210,33 @@ async def receive_webhook(request: Request):
             if happened_at_time_str:
                 happened_at_time_dt = datetime.fromisoformat(happened_at_time_str.replace('Z', '+00:00'))
             
-            # --- LÓGICA DE PARSEO (v65/v66) ---
+            # --- LÓGICA DE PARSEO (v71) ---
+
+            # PASO 1: (v71) Buscar un VEHÍCULO genérico en 'details'.
+            # Esto es clave, ya que "Form Submitted" SÍ puede incluir este objeto
+            # si la alerta está configurada para monitorear un vehículo.
+            if "vehicle" in details and details.get("vehicle"):
+                vehicle_data = details["vehicle"]
+                vehicle_id_str = vehicle_data.get("id", "N/A")
+                vehicle_name_str = vehicle_data.get("name", "N/A") 
+                logger.info(f"Parseo v71 (Paso 1): Encontrado vehículo genérico: {vehicle_id_str}")
+
+            # PASO 2: Buscar IDs de vehículo en alertas específicas (Gateway)
+            # Esto puede sobrescribir la Referencia si es más específico
+            if details.get("gatewayUnplugged") and details["gatewayUnplugged"].get("vehicle"):
+                vehicle_data = details["gatewayUnplugged"]["vehicle"]
+                vehicle_id_str = vehicle_data.get("id", vehicle_id_str) # Usar ID si no hay uno
+                vehicle_name_str = vehicle_data.get("name", "N/A") # Referencia = Vehicle Name
             
-            # CASO 1: Es una alerta de "Form Submitted"
+            elif details.get("gatewayDisconnected") and details["gatewayDisconnected"].get("vehicle"):
+                vehicle_data = details["gatewayDisconnected"]["vehicle"]
+                vehicle_id_str = vehicle_data.get("id", vehicle_id_str) # Usar ID si no hay uno
+                vehicle_name_str = vehicle_data.get("name", "N/A") # Referencia = Vehicle Name
+
+            # PASO 3: Si es "Form Submitted", *modificar* el tipo de alerta
+            # y *sobrescribir* la REFERENCIA (vehicle_name) al Driver ID.
             if alert_type_str == "Form Submitted" and details.get("formSubmitted"):
                 form_data = details.get("formSubmitted", {}).get("form", {})
-                form_title = form_data.get("title", "Formulario Enviado")
                 fields = form_data.get("fields", [])
                 emergency_answer = "N/D"
                 question_to_find = "¿Tienes una emergencia (accidente, riesgo médico, robo)?" 
@@ -246,59 +247,47 @@ async def receive_webhook(request: Request):
                             emergency_answer = field["multipleChoiceValue"].get("value", "N/D")
                             break
                 
-                # (REQUISITO v65) Formatear el tipo de alerta
-                alert_type_str = f"Form: {form_title} ({emergency_answer})"
+                # (v68) Formato: "Form: [Respuesta]"
+                alert_type_str = f"Form: {emergency_answer}"
                 
-                # (REQUISITO v66) Formatear la Referencia (vehicle_name)
                 submitter_info = form_data.get("submittedBy")
                 if submitter_info and submitter_info.get("type") == "driver":
                     driver_id = submitter_info.get('id', 'N/A')
-                    # --- (MODIFICACIÓN v66) ---
-                    # La referencia ahora es SÓLO el ID del conductor
+                    # (v71) La *Referencia* (vehicle_name) es el Driver ID
                     vehicle_name_str = driver_id 
-                    vehicle_id_str = driver_id
+                    
+                    # (FIX v71) Si *aún* no tenemos un vehicle_id (del Paso 1 o 2),
+                    # entonces este es un formulario "sin vehículo" y usamos el
+                    # driver_id como el ID de filtro.
+                    if vehicle_id_str == "N/A":
+                        vehicle_id_str = driver_id
+                        logger.info(f"Parseo v71 (Paso 3): Formulario sin vehículo. Usando Driver ID ({driver_id}) como ID de filtro.")
                 else:
-                    # --- (MODIFICACIÓN v66) ---
-                    vehicle_name_str = "Driver ID N/A" # Fallback
-            
-            # CASO 2: Es cualquier otra alerta (Ej. Gateway Unplugged)
-            else:
-                gateway_info = details.get("gatewayUnplugged") or details.get("gatewayDisconnected")
-                if gateway_info and gateway_info.get("vehicle"):
-                    # (REQUISITO v65) La referencia es el nombre del vehículo
-                    vehicle_name_str = gateway_info["vehicle"].get("name", "N/A")
-                    vehicle_id_str = gateway_info["vehicle"].get("id", "N/A")
-
+                     if vehicle_name_str == "N/A": # Si no hay vehículo Y no hay driver
+                        vehicle_name_str = "Driver ID N/A"
             # --- Fin de Lógica de Parseo ---
 
-            # Aquí es donde se guarda en la base de datos
             event_to_store = {
                 "event_id": payload.eventId,
                 "timestamp": happened_at_time_dt, 
-                "alert_type": alert_type_str,      # Tipo de alerta (Formateado o Descripción)
-                "message": details,                # JSON de detalles
-                "vehicle_name": vehicle_name_str,  # "Referencia" (Vehículo o Driver ID)
-                "vehicle_id": vehicle_id_str,      # ID (Vehículo o Driver)
-                "incident_url": incident_url_str,  # (NUEVO v65) -> Aquí se pasa la URL
+                "alert_type": alert_type_str,
+                "message": details,
+                "vehicle_name": vehicle_name_str,  # "Referencia"
+                "vehicle_id": vehicle_id_str,      # "ID de Filtro"
+                "incident_url": incident_url_str,
                 "raw_json": payload.dict() 
             }
             
-            logger.info(f"Insertando Alerta: {alert_type_str} para {vehicle_name_str} (URL: {incident_url_str})")
+            logger.info(f"Insertando Alerta: {alert_type_str} para Ref: {vehicle_name_str} (Filtro ID: {vehicle_id_str}) (URL: {incident_url_str})")
             
             query = alerts.insert().values(event_to_store)
             await database.execute(query)
 
-            # Éxito: Devolver 200 OK
             return {"status": "success", "data_received": True}
 
         except Exception as e:
             logger.error(f"Error al procesar AlertIncident: {e}")
-            # Devolver 500 para indicarle a Samsara que el error fue interno (la base de datos)
             raise HTTPException(status_code=500, detail=f"Error al procesar: {e}")
-
-    # --- (ELIMINADO v65) ---
-    # El bloque 'elif payload.eventType == "FormSubmitted"' se eliminó
-    # porque el payload real muestra que está anidado en 'AlertIncident'.
 
     logger.info(f"Evento no manejado: {payload.eventType}")
     return {"status": "success", "event_type_unhandled": payload.eventType}
@@ -307,3 +296,4 @@ async def receive_webhook(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+}
