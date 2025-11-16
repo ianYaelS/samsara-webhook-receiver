@@ -3,12 +3,15 @@
 #
 # Aplicación Principal del Dashboard "Reefer-Tech" con Streamlit.
 #
-# v66 (Ajustes de UI Fina)
-# 1. (UI) Log de alertas: Añadido 'max_chars=40' a 'Tipo de alerta'
-#    para evitar que la tabla se ensanche con texto largo.
-# 2. (UI) Revertido el st.expander a st.container para el log de alertas.
-# 3. (UI) Log de alertas: use_container_width=False para tabla ajustada.
-# 4. (UI) Log de alertas: Reordenadas columnas (Tipo, Incidente, Hora, Ref).
+# v72 (Mejoras de UI de Alertas)
+#
+# 1. (UI) La tabla de alertas ahora muestra las 7 últimas alertas (limit 7).
+# 2. (UI) La columna "Hora" se reemplaza por "Fecha / Hora"
+#    con el formato YYYY-MM-DD HH:MM.
+# 3. (UI) Se elimina la columna "Referencia" de la tabla de alertas
+#    para una vista más limpia.
+#
+# (Depende de utils.py v73 para funcionar)
 # --------------------------------------------------------------------------
 
 import streamlit as st
@@ -32,7 +35,8 @@ from streamlit_autorefresh import st_autorefresh
 import os
 import databases
 import sqlalchemy
-from sqlalchemy import Column, Integer, String, DateTime, JSON, MetaData
+# (v71) Importar 'or_' para la nueva consulta de filtro
+from sqlalchemy import Column, Integer, String, DateTime, JSON, MetaData, or_
 from dotenv import load_dotenv
 import asyncio
 # --- Fin de imports modificados ---
@@ -47,6 +51,7 @@ st.set_page_config(
 )
 
 MEXICO_TZ = pytz.timezone("America/Mexico_City") 
+STALE_THRESHOLD_MINUTES = 10 # (v68) Límite para considerar un dato "obsoleto"
 
 # v59: Intervalo de refresco reducido a 20 segundos para mayor fluidez.
 REFRESH_INTERVAL_SEC = 20
@@ -76,8 +81,8 @@ alerts = sqlalchemy.Table(
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("event_id", String, unique=True, index=True),
     Column("timestamp", DateTime(timezone=True)),
-    Column("vehicle_id", String),
-    Column("vehicle_name", String), # <--- Esta columna ahora es "Referencia"
+    Column("vehicle_id", String), # (v71) ID del Vehículo O ID del Conductor
+    Column("vehicle_name", String), # "Referencia" (Nombre Vehículo o ID Conductor)
     Column("alert_type", String),
     Column("message", JSON),
     Column("incident_url", String, nullable=True), # <--- NUEVA COLUMNA
@@ -99,10 +104,9 @@ metadata_db = alerts.metadata # Usamos el metadata asociado a la tabla alerts
 # --- INICIALIZACIÓN DE SESSION_STATE ---
 try:
     if 'api_client' not in st.session_state:
-        # Nota: SAMSARA_API_KEY debe estar en un archivo .env si se corre localmente
         if not utils.SAMSARA_API_KEY:
-            # st.error ya se maneja en el archivo utils.py
-            pass
+            # (v73) Este error es más claro si SAMSARA_API_KEY falta
+            raise ValueError("SAMSARA_API_KEY no se encontró. Asegúrate de que esté en tu archivo .env")
         st.session_state.api_client = utils.SamsaraAPIClient(api_key=utils.SAMSARA_API_KEY)
     if 'ai_model' not in st.session_state:
         st.session_state.ai_model = utils.AIModels()
@@ -119,6 +123,10 @@ if 'selected_vehicle_name' not in st.session_state:
     st.session_state.selected_vehicle_name = None
 if 'selected_vehicle_obj' not in st.session_state:
     st.session_state.selected_vehicle_obj = None
+if 'selected_vehicle_id' not in st.session_state: # (v68) ID para filtrar alertas
+    st.session_state.selected_vehicle_id = None
+if 'assigned_driver_id' not in st.session_state: # (v71) ID de conductor para filtrar
+    st.session_state.assigned_driver_id = None
 if 'sensor_config' not in st.session_state:
     st.session_state.sensor_config = None
 if 'last_webhook_timestamp' not in st.session_state:
@@ -131,26 +139,20 @@ if 'last_alert_id' not in st.session_state:
 # --- CSS ---
 st.markdown("""
 <style>
-    /* Ajustes del contenedor principal (si es necesario) */
     .block-container { 
         padding-top: 2rem; padding-bottom: 2rem; 
         padding-left: 3rem; padding-right: 3rem;
     }
-
-    /* Asegurar que todos los contenedores de KPI en la primera fila sean de la misma altura */
-    div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"]:nth-child(1) {
-        height: 100%;
-    }
-    
-    /* Estilos de KPIs (st.metric) - Usado por Temp, Hum, Bat */
     .stMetric {
         border-bottom: 1px solid #262730; 
         padding-bottom: 0.5rem;
     }
-    
-    /* FIX: Para el mapa y alertas, forzar a que la fila ocupe el espacio */
-    div[data-testid="stVerticalBlock"] > div[data-testid="stHorizontalBlock"] {
-        height: 100%;
+    /* (v68) Estilo para KPI Obsoleto (Stale) */
+    .stMetric[data-stale="true"] {
+        opacity: 0.6;
+    }
+    .stMetric[data-stale="true"] .stMetricLabel {
+        color: #ffc107; /* Amarillo advertencia */
     }
 </style>
 """, unsafe_allow_html=True)
@@ -159,23 +161,35 @@ st.markdown("""
 # --- 2. TÍTULO Y AUTO-REFRESCO ---
 
 st.title("❄️ Samsara Reefer-Tech")
-# v59: Caption actualizado para reflejar el nuevo intervalo de refresco
 st.caption(f"Monitoreo en tiempo real de temperatura, puertas y GPS. (Refresca cada {REFRESH_INTERVAL_SEC}s)")
 
-# Auto-refresco global para datos de API
-st_autorefresh(interval=REFRESH_INTERVAL_SEC * 1000, limit=None, key="data_refresher")
+# (v68) Auto-refresco global. 'count' es la clave para bustear la caché de alertas.
+count = st_autorefresh(interval=REFRESH_INTERVAL_SEC * 1000, limit=None, key="data_refresher")
 
 
 # --- 3. FUNCIONES DE CARGA DE DATOS (CACHEADAS) ---
 
-# Cachear lista de vehículos por 10 minutos
+# --- (MODIFICADO v73) ---
 @st.cache_data(ttl=600)
 def load_vehicle_list(_api_client):
-    if not _api_client: return [], {}
-    vehicles = _api_client.get_vehicles()
+    """
+    (v71) Cachear lista de vehículos por 10 minutos.
+    (v73) Esta función ahora depende de 'utils.py (v73)'
+          para aplicar el mapeo de respaldo.
+    """
+    if not _api_client: return [], {}, {}
+    # (v73) 'get_vehicles' ahora devuelve 2 items (el mapa ya está procesado)
+    vehicles, vehicle_driver_map = _api_client.get_vehicles()
+    
+    if not vehicles:
+        st.error("No se encontraron vehículos activos en la API de Samsara.")
+        return [], {}, {}
+    
     vehicle_map_obj = {v['name']: v for v in vehicles}
     vehicle_names = [v['name'] for v in vehicles]
-    return vehicle_names, vehicle_map_obj
+    
+    print(f"Vehicle/Driver Map (Final, v73): {vehicle_driver_map}")
+    return vehicle_names, vehicle_map_obj, vehicle_driver_map
 
 # v59: TTL (cache) se ata automáticamente a REFRESH_INTERVAL_SEC (20s)
 @st.cache_data(ttl=REFRESH_INTERVAL_SEC)
@@ -337,17 +351,27 @@ def render_vehicle_info_and_sensors(vehicle_obj, sensor_config):
         st.sidebar.error("No se ha seleccionado ningún vehículo.")
         return
         
-    st.sidebar.markdown(f"<div class='vehicle-info-header'>Vehículo</div>", unsafe_allow_html=True)
-    st.sidebar.markdown(f"<div class='vehicle-info-value'>{vehicle_obj.get('name', 'N/A')}</div>", unsafe_allow_html=True)
+    st.sidebar.markdown(f"<div class'vehicle-info-header'>Vehículo</div>", unsafe_allow_html=True)
+    st.sidebar.markdown(f"<div class'vehicle-info-value'>{vehicle_obj.get('name', 'N/A')}</div>", unsafe_allow_html=True)
     
     if vehicle_obj.get('serial'):
-        st.sidebar.markdown(f"<div class='vehicle-info-header' style='margin-top: 5px;'>Serial</div>", unsafe_allow_html=True)
-        st.sidebar.markdown(f"<div class='vehicle-info-value'>{vehicle_obj.get('serial')}</div>", unsafe_allow_html=True)
+        st.sidebar.markdown(f"<div class'vehicle-info-header' style='margin-top: 5px;'>Serial</div>", unsafe_allow_html=True)
+        st.sidebar.markdown(f"<div class'vehicle-info-value'>{vehicle_obj.get('serial')}</div>", unsafe_allow_html=True)
     
-    st.sidebar.markdown(f"<div class='vehicle-info-header' style='margin-top: 5px;'>ID</div>", unsafe_allow_html=True)
-    st.sidebar.markdown(f"<div class='vehicle-info-value'>{vehicle_obj.get('id')}</div>", unsafe_allow_html=True)
+    st.sidebar.markdown(f"<div class'vehicle-info-header' style='margin-top: 5px;'>ID</div>", unsafe_allow_html=True)
+    st.sidebar.markdown(f"<div class'vehicle-info-value'>{vehicle_obj.get('id')}</div>", unsafe_allow_html=True)
     
-    st.sidebar.markdown(f"<div class='sensor-list-header' style='margin-top: 10px;'>Dispositivos Pareados</div>", unsafe_allow_html=True)
+    # (v71) Mostrar conductor asignado
+    if st.session_state.assigned_driver_id:
+        st.sidebar.markdown(f"<div class'vehicle-info-header' style='margin-top: 5px;'>Conductor Asignado (para Alertas)</div>", unsafe_allow_html=True)
+        st.sidebar.markdown(f"<div class'vehicle-info-value'>{st.session_state.assigned_driver_id}</div>", unsafe_allow_html=True)
+    else:
+        # (v73) Mostrar si no hay conductor
+        st.sidebar.markdown(f"<div class'vehicle-info-header' style='margin-top: 5px;'>Conductor Asignado (para Alertas)</div>", unsafe_allow_html=True)
+        st.sidebar.markdown(f"<div class'vehicle-info-value' style='color: #ffc107;'>Ninguno (API reportó 'None')</div>", unsafe_allow_html=True)
+
+    
+    st.sidebar.markdown(f"<div class'sensor-list-header' style='margin-top: 10px;'>Dispositivos Pareados</div>", unsafe_allow_html=True)
     
     if not sensor_config:
         st.sidebar.caption("No hay 'sensorConfiguration' para este vehículo.")
@@ -540,67 +564,109 @@ def render_history_charts(df, title_suffix):
     
     return df
 
-# Esta función es la nueva forma de llamar a la lógica de alerta.
-# Se le da un 'key' que Streamlit usa para determinar si debe reejecutar la función.
-@st.cache_data(ttl=8) # Refresco cada 8 segundos
-def run_alert_log(database_url_key):
+# --- (MODIFICADO v72) ---
+@st.cache_data(ttl=8) # TTL de 8s (protección contra ráfagas)
+def run_alert_log(database_url_key, refresh_nonce, vehicle_id, driver_id):
     """
-    Función de contenedor no-asíncrona para la lógica asíncrona de alertas.
+    (v71) Función de contenedor no-asíncrona para la lógica asíncrona de alertas.
+    - 'refresh_nonce' (del autorefresh) es la clave para forzar el refresco de caché.
+    - 'vehicle_id' y 'driver_id' filtran las alertas.
+    (v72) - Límite cambiado a 7.
     """
-    async def fetch_alerts():
+    async def fetch_alerts(vid, did):
         """
         Función asíncrona real que interactúa con la base de datos.
         """
         if not database.is_connected:
             await database.connect()
             
-        # Consulta de alertas
-        query = alerts.select().order_by(alerts.c.timestamp.desc()).limit(15)
+        # (v71) Consulta ahora filtra por vehicle_id O driver_id (si existe)
+        filter_conditions = [alerts.c.vehicle_id == vid]
+        if did:
+            filter_conditions.append(alerts.c.vehicle_id == did)
+            print(f"FETCH_ALERTS (v71): Buscando por vehicle_id={vid} O driver_id={did}")
+        else:
+            print(f"FETCH_ALERTS (v71): Buscando solo por vehicle_id={vid} (sin conductor asignado)")
+
+        
+        query = alerts.select().where(
+            or_(*filter_conditions) # Usar 'or_' para combinar las condiciones
+        ).order_by(
+            alerts.c.timestamp.desc()
+        ).limit(7) # (v72) Muestra los últimos 7
+        
         results = await database.fetch_all(query)
         
-        # --- FIX CRÍTICO: CONVERTIR A LISTA DE DICCIONARIOS SERIALIZABLES ---
-        # (v65) a_dict() es necesario para el nuevo tipo de resultado de SQLAlchemy 2.0
         serializable_results = [dict(row._mapping) for row in results]
         
-        # FIX: Desconexión obligatoria para liberar el lock de conexión en el pool
         try:
-            await database.disconnect() 
+            # (v73) Asegurar que la desconexión solo ocurra si está conectada
+            if database.is_connected:
+                await database.disconnect() 
         except Exception as e:
-            # Ignorar errores si la desconexión falla (ej. ya estaba desconectada)
             print(f"Advertencia al desconectar DB: {e}") 
         
         return serializable_results
 
     try:
-        results = asyncio.run(fetch_alerts())
+        # El 'refresh_nonce' asegura que esta función se re-ejecute
+        print(f"RUN_ALERT_LOG: Refrescando alertas para veh={vehicle_id}, drv={driver_id} (Nonce: {refresh_nonce})")
+        results = asyncio.run(fetch_alerts(vehicle_id, driver_id))
         return results
     except Exception as e:
         print(f"Error en run_alert_log (fetch_alerts): {e}")
         return []
 
-# --- (MODIFICADO v65/v66) ---
-def render_alert_log_section():
+# --- (MODIFICADO v71) ---
+async def clear_vehicle_alerts(vehicle_id, driver_id):
     """
-    Renderiza la sección de Alertas en Vivo (Webhooks)
+    (v71) Función asíncrona para borrar alertas de un vehículo Y su conductor.
+    """
+    try:
+        if not database.is_connected:
+            await database.connect()
+        
+        # (v71) Borrar por vehicle_id O driver_id (si existe)
+        filter_conditions = [alerts.c.vehicle_id == vehicle_id]
+        if driver_id:
+            filter_conditions.append(alerts.c.vehicle_id == driver_id)
+        
+        query = alerts.delete().where(or_(*filter_conditions))
+        await database.execute(query)
+        
+        if database.is_connected:
+            await database.disconnect()
+        
+        print(f"ALERT_CLEAR: Alertas borradas para veh={vehicle_id} o drv={driver_id}")
+        return True
+    except Exception as e:
+        print(f"Error en clear_vehicle_alerts: {e}")
+        return False
+
+# --- (MODIFICADO v72) ---
+def render_alert_log_section(results):
+    """
+    (v70) Renderiza la sección de Alertas en Vivo (Webhooks)
+    (v72) - Formato de fecha cambiado, columna 'Referencia' eliminada.
     """
     
-    results = run_alert_log(DATABASE_URL)
-
     if not results:
-        st.info("No se han registrado alertas (webhooks) en la base de datos.")
+        st.info(f"No hay alertas registradas para este vehículo/conductor.")
         return
 
-    # Lógica de notificación (basada en el ID del evento, no la tabla)
+    # --- (v68) Lógica de notificación global (arreglada por el 'refresh_nonce') ---
     latest_alert_id = results[0]['event_id']
     
     if st.session_state.last_alert_id is None:
+        # Inicializar el estado en el primer refresco
         st.session_state.last_alert_id = latest_alert_id
     
     elif latest_alert_id != st.session_state.last_alert_id:
+        # Si el ID más reciente es NUEVO, notificar y actualizar el estado
         alert_msg = f"¡Nueva Alerta: {results[0]['alert_type']} en {results[0]['vehicle_name']}!"
         st.error(alert_msg, icon="🚨")
-        # --- FIX: Reproducción de audio robusta (HTML injection) ---
-        audio_url = "https://cdn.pixabay.com/audio/22/03/15/audio_2210e72c83.mp3" # Sonido corto de alerta
+        
+        audio_url = "https://cdn.pixabay.com/audio/22/03/15/audio_2210e72c83.mp3"
         st.markdown(
             f"""
             <audio autoplay controls style="display:none;">
@@ -609,60 +675,55 @@ def render_alert_log_section():
             """,
             unsafe_allow_html=True
         )
+        # Actualizar el estado al ID más reciente
         st.session_state.last_alert_id = latest_alert_id
+    # --- Fin de la lógica de notificación ---
 
-    # Preparar DataFrame (Hora, Referencia, Tipo de alerta, Incidente)
     data_for_df = []
     for row in results:
         timestamp_utc = row['timestamp']
         if timestamp_utc:
             if timestamp_utc.tzinfo is None:
                  timestamp_utc = timestamp_utc.replace(tzinfo=pytz.utc)
-            timestamp_local = timestamp_utc.astimezone(MEXICO_TZ).strftime('%H:%M:%S')
+            # (v72) Formato de fecha cambiado
+            timestamp_local = timestamp_utc.astimezone(MEXICO_TZ).strftime('%Y-%m-%d %H:%M')
         else:
             timestamp_local = "N/A"
         
         data_for_df.append({
-            "Hora": timestamp_local,
-            "Referencia": row['vehicle_name'],     # (REQUISITO v65) Columna renombrada
+            "Fecha / Hora": timestamp_local,
+            # "Referencia": row['vehicle_name'], # (v72) Columna eliminada
             "Tipo de alerta": row['alert_type'],
-            "Incidente": row.get('incident_url')   # (REQUISITO v65) Nueva columna
+            "Incidente": row.get('incident_url')
         })
     
     df_alerts = pd.DataFrame(data_for_df)
     
-    # (REQUISITO v65/v66) Usar st.data_editor para mostrar el link clickeable
     st.data_editor(
         df_alerts, 
         hide_index=True, 
-        use_container_width=False, # <-- (MODIFICACIÓN v66) Ajustar ancho
-        disabled=True, # Hacer la tabla de solo lectura
+        use_container_width=True, # (v73) Ajustar para que llene la columna
+        disabled=True,
         column_config={
             "Incidente": st.column_config.LinkColumn(
                 "Incidente",
-                display_text="Ver Incidente", # Texto que se muestra en el link
+                display_text="Ver Incidente", 
                 help="Click para abrir la URL del incidente en Samsara"
             ),
-            "Referencia": st.column_config.TextColumn(
-                "Referencia",
-                width="medium" # Ajustar ancho
-            ),
+            # (v72) Columna 'Referencia' eliminada
             "Tipo de alerta": st.column_config.TextColumn(
                 "Tipo de alerta",
-                width="large", # Ajustar ancho
-                # --- (MODIFICACIÓN v66) ---
-                # Trunca el texto si es muy largo para mantener la tabla compacta
-                max_chars=40, 
+                width="large",
+                max_chars=40, # (v67) Trunca el texto
                 help="El tipo de alerta (truncado a 40 caracteres si es muy largo)"
-                # --- (FIN MODIFICACIÓN v66) ---
             ),
-             "Hora": st.column_config.TextColumn(
-                "Hora",
-                width="small" # Ajustar ancho
+             "Fecha / Hora": st.column_config.TextColumn( # (v72) Renombrada
+                "Fecha / Hora",
+                width="medium" # (v72) Ancho ajustado
             )
         },
-        # --- (MODIFICACIÓN v66) Nuevo orden de columnas ---
-        column_order=("Tipo de alerta", "Incidente", "Hora", "Referencia")
+        # --- (MODIFICACIÓN v72) Nuevo orden de columnas ---
+        column_order=("Fecha / Hora", "Incidente", "Tipo de alerta")
     )
 
 
@@ -691,7 +752,8 @@ def get_ia_prediction(_ai_model, temperature_series, step_sec_ai):
 
 # --- 5. INICIALIZACIÓN DE LA APP ---
 
-vehicle_names, vehicle_map_obj = load_vehicle_list(st.session_state.api_client)
+# (v73) Cargar el nuevo mapa de conductores (ahora depende de utils v73)
+vehicle_names, vehicle_map_obj, vehicle_driver_map = load_vehicle_list(st.session_state.api_client)
 
 if not vehicle_names:
     st.error("No se pudieron cargar los vehículos. ¿La clave de API es correcta y tiene permisos?")
@@ -701,18 +763,30 @@ if not vehicle_names:
 
 st.sidebar.title("Panel de Control")
 
+# --- (MODIFICADO v71) ---
 def on_vehicle_change():
+    """(v71) Al cambiar de vehículo, guardar el ID del vehículo Y el ID del conductor."""
     st.session_state.selected_vehicle_obj = vehicle_map_obj.get(st.session_state.selected_vehicle_name)
     if st.session_state.selected_vehicle_obj:
         st.session_state.sensor_config = st.session_state.selected_vehicle_obj.get('sensorConfiguration')
+        # (v68) Guardar el ID para filtrar alertas
+        st.session_state.selected_vehicle_id = st.session_state.selected_vehicle_obj.get('id')
+        # (v71) Guardar el ID del conductor asignado (puede ser None o de respaldo v73)
+        st.session_state.assigned_driver_id = vehicle_driver_map.get(st.session_state.selected_vehicle_id)
+        print(f"ON_VEHICLE_CHANGE (v71/v73): Vehículo: {st.session_state.selected_vehicle_id}, Conductor: {st.session_state.assigned_driver_id}")
+
     else:
         st.session_state.sensor_config = None
+        st.session_state.selected_vehicle_id = None
+        st.session_state.assigned_driver_id = None
+        
     st.cache_data.clear()
+    st.session_state.last_alert_id = None # (v70) Resetear notificador al cambiar de veh.
 
 
 if st.session_state.selected_vehicle_name is None and vehicle_names:
     st.session_state.selected_vehicle_name = vehicle_names[0]
-    on_vehicle_change()
+    on_vehicle_change() # Cargar el primer vehículo
 
 st.sidebar.selectbox(
     "Selecciona un Vehículo:",
@@ -725,11 +799,17 @@ st.sidebar.selectbox(
 if not st.session_state.selected_vehicle_obj:
     st.error("Error al cargar datos del vehículo.")
     st.stop()
+    
+# --- (v69) Botón de Limpiar Alertas movido a la columna principal ---
+
 
 # --- 7. CARGA DE DATOS PRINCIPAL (CACHEADA) ---
 selected_vehicle_id = st.session_state.selected_vehicle_obj['id']
 selected_vehicle_name = st.session_state.selected_vehicle_obj['name']
 sensor_config = st.session_state.sensor_config
+# (v71) Obtener el ID del conductor para filtrar
+assigned_driver_id = st.session_state.get('assigned_driver_id')
+
 
 # 1. SNAPSHOT (Para Mapa y Check Engine)
 live_stats = fetch_live_kpis(
@@ -780,7 +860,6 @@ alert_incidents = fetch_alert_incidents(
 # 6. (v44) PROCESAR ALERTA DE PUERTA (API)
 latest_door_alert = None
 if alert_incidents and 'data' in alert_incidents:
-    # Ordenar por 'startedAt' descendente para obtener la más reciente primero
     sorted_alerts = sorted(
         alert_incidents['data'], 
         key=lambda x: x.get('startedAt', '1970-01-01T00:00:00Z'), 
@@ -806,102 +885,84 @@ render_fault_codes(all_fault_codes_list, live_fault_codes_obj)
 # --- FILA DE KPIs (ACTUALIZADA CADA 30S) ---
 kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
 
-# FIX: Altura de contenedor unificada a 200px.
 KPI_HEIGHT = 200
 
-# --- v63: KPI DE PUERTA (Refactor con HTML/CSS) ---
+# --- (v68) KPI DE PUERTA (Con lógica de STALE) ---
 with kpi_col1:
     with st.container(border=True, height=KPI_HEIGHT):
-        
-        # --- 1. Inicializar variables ---
         door_val_str, door_emoji = "N/A", "🚪"
-        door_color = "#333333" # Gris oscuro por defecto
-        
-        # Textos para el detalle
+        door_color = "#333333"
         telemetria_time_str = "Últ. telemetría: N/A"
         prev_event_time_str = "Evento previo: N/A"
+        is_stale = True
         
         df_door_1h = df_history_1h.get('doorClosed')
         
         if df_door_1h is not None and not df_door_1h.empty:
-            # --- 2. Obtener estado actual ---
             latest_door_status = df_door_1h.iloc[-1]
             latest_door_time = df_door_1h.index[-1]
-            # (Requisito) Hora de la última telemetría
             telemetria_time_str = f"Últ. telemetría: {latest_door_time.strftime('%H:%M:%S')}"
             
-            # Definir estado actual, color y texto de estado opuesto
-            if latest_door_status == 1:
-                door_val_str = "Puerta Cerrada" # (Requisito)
-                door_emoji = "🔒"
-                door_color = "#28a745" # (Requisito) Verde
-                opposite_state_str = "abierta"
+            # (v68) Lógica de Stale
+            time_diff_seconds = (datetime.now(MEXICO_TZ) - latest_door_time).total_seconds()
+            if time_diff_seconds > (STALE_THRESHOLD_MINUTES * 60):
+                is_stale = True
+                door_emoji = "⏳"
+                telemetria_time_str = f"Últ. telemetría: (Hace >{STALE_THRESHOLD_MINUTES}m)"
             else:
-                door_val_str = "Puerta Abierta" # (Requisito)
-                door_emoji = "🚨"
-                door_color = "#dc3545" # (Requisito) Rojo
-                opposite_state_str = "cerrada"
+                is_stale = False
 
-            # --- 3. Encontrar el timestamp del ÚLTIMO ESTADO OPUESTO ---
+            if latest_door_status == 1:
+                door_val_str = "Puerta Cerrada"
+                door_emoji = "🔒" if not is_stale else door_emoji
+                door_color = "#28a745" # Verde
+            else:
+                door_val_str = "Puerta Abierta"
+                door_emoji = "🚨" if not is_stale else door_emoji
+                door_color = "#dc3545" # Rojo
+            
+            if is_stale:
+                door_color = "#555" # Gris oscuro si es obsoleto
+
             try:
-                # Encontrar todos los eventos DIFERENTES al estado actual
                 different_events = df_door_1h[df_door_1h != latest_door_status]
-                
                 if not different_events.empty:
-                    # Obtener el timestamp del ÚLTIMO evento diferente
                     last_opposite_time = different_events.index[-1]
-                    # (Requisito) Hora del evento previo
-                    prev_event_time_str = f"Evento previo (últ. {opposite_state_str}): {last_opposite_time.strftime('%H:%M')}"
+                    prev_event_time_str = f"Evento previo: {last_opposite_time.strftime('%H:%M')}"
                 else:
-                    # Si no hay eventos diferentes, ha estado así por >1h
                     prev_event_time_str = f"Evento previo: (hace >1h)"
             except Exception as e:
-                print(f"Error al calcular el tiempo de cambio de puerta: {e}")
                 prev_event_time_str = "Evento previo: Error"
         
-        # --- 4. (v63) Lógica de Alerta API eliminada del KPI ---
-
-        # --- 5. Renderizar el KPI con HTML/CSS ---
         st.markdown(f"""
         <div style="
             background-color: {door_color};
             border-radius: 8px;
             padding: 12px;
-            height: 105px; /* Altura fija para el texto, deja espacio para el gráfico */
+            height: 105px;
             display: flex;
             flex-direction: column;
             justify-content: center;
-            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            opacity: {0.6 if is_stale else 1.0};
         ">
-            <div style="
-                font-size: 1.2rem; 
-                font-weight: bold; 
-                color: white; 
-                line-height: 1.2;
-                text-shadow: 1px 1px 2px rgba(0,0,0,0.2);
-            ">
+            <div style="font-size: 1.2rem; font-weight: bold; color: white; line-height: 1.2;">
                 {door_emoji} {door_val_str}
             </div>
-            <div style="
-                font-size: 0.75rem; 
-                color: #f0f2f6; /* Blanco suave */
-                line-height: 1.3;
-                margin-top: 8px;
-            ">
+            <div style="font-size: 0.75rem; color: #f0f2f6; line-height: 1.3; margin-top: 8px;">
                 {telemetria_time_str}<br>
                 {prev_event_time_str}
             </div>
         </div>
         """, unsafe_allow_html=True)
         
-        # Renderizar el mini-gráfico (sin cambios)
         render_mini_chart(df_door_1h, "#3498DB")
 
-# --- v60: KPI DE TEMPERATURA (Refactor de consistencia) ---
+# --- (v68) KPI DE TEMPERATURA (Con lógica de STALE) ---
 with kpi_col2:
     with st.container(border=True, height=KPI_HEIGHT):
         temp_val_str, temp_time_str = "N/A", "(N/A)"
-        temp_emoji = "🌡️" # v60
+        temp_emoji = "🌡️"
+        is_stale = True
         df_temp_1h = df_history_1h.get('temperature')
         
         if df_temp_1h is not None and not df_temp_1h.empty:
@@ -909,15 +970,29 @@ with kpi_col2:
             latest_temp_time = df_temp_1h.index[-1]
             temp_val_str = f"{latest_temp:.1f} °C"
             temp_time_str = latest_temp_time.strftime('(%H:%M)')
+            
+            # (v68) Lógica de Stale
+            time_diff_seconds = (datetime.now(MEXICO_TZ) - latest_temp_time).total_seconds()
+            if time_diff_seconds > (STALE_THRESHOLD_MINUTES * 60):
+                is_stale = True
+                temp_emoji = "⏳"
+                temp_time_str = f"(Hace >{STALE_THRESHOLD_MINUTES}m)"
+            else:
+                is_stale = False
         
-        st.metric(label=f"{temp_emoji} Temperatura {temp_time_str}", value=temp_val_str)
+        st.metric(label=f"{temp_emoji} Temperatura {temp_time_str}", value=temp_val_str,
+                  help=f"Última lectura: {latest_temp_time.strftime('%H:%M:%S')}" if 'latest_temp_time' in locals() else "Sin datos")
+        # (v68) Aplicar el estilo de obsoleto al contenedor
+        st.markdown(f'<style>div[data-testid="stMetric"][data-stale="{is_stale}"]</style>', unsafe_allow_html=True)
+        
         render_mini_chart(df_temp_1h, "#FFA500")
 
-# --- v6D: KPI DE HUMEDAD (Refactor de consistencia) ---
+# --- (v68) KPI DE HUMEDAD (Con lógica de STALE) ---
 with kpi_col3:
     with st.container(border=True, height=KPI_HEIGHT):
         hum_val_str, hum_time_str = "N/A", "(N/A)"
-        hum_emoji = "💧" # v60
+        hum_emoji = "💧"
+        is_stale = True
         df_hum_1h = df_history_1h.get('humidity')
 
         if df_hum_1h is not None and not df_hum_1h.empty:
@@ -925,16 +1000,26 @@ with kpi_col3:
             latest_hum_time = df_hum_1h.index[-1]
             hum_val_str = f"{latest_hum:.0f} %"
             hum_time_str = latest_hum_time.strftime('(%H:%M)')
+            
+            time_diff_seconds = (datetime.now(MEXICO_TZ) - latest_hum_time).total_seconds()
+            if time_diff_seconds > (STALE_THRESHOLD_MINUTES * 60):
+                is_stale = True
+                hum_emoji = "⏳"
+                hum_time_str = f"(Hace >{STALE_THRESHOLD_MINUTES}m)"
+            else:
+                is_stale = False
         
-        st.metric(label=f"{hum_emoji} Humedad {hum_time_str}", value=hum_val_str)
-        # v56: Color cambiado para diferenciarlo de la puerta
+        st.metric(label=f"{hum_emoji} Humedad {hum_time_str}", value=hum_val_str,
+                  help=f"Última lectura: {latest_hum_time.strftime('%H:%M:%S')}" if 'latest_hum_time' in locals() else "Sin datos")
+        st.markdown(f'<style>div[data-testid="stMetric"][data-stale="{is_stale}"]</style>', unsafe_allow_html=True)
         render_mini_chart(df_hum_1h, "#5DADE2")
             
-# --- v60: KPI DE BATERÍA (Refactor de consistencia) ---
+# --- (v68) KPI DE BATERÍA (Con lógica de STALE) ---
 with kpi_col4:
     with st.container(border=True, height=KPI_HEIGHT):
         bat_val_str, bat_time_str = "N/A", "(N/A)"
-        bat_emoji = "🔋" # v60
+        bat_emoji = "🔋"
+        is_stale = True
         df_bat_1h = df_battery_history_1h.get('value')
         
         if df_bat_1h is not None and not df_bat_1h.empty:
@@ -942,10 +1027,18 @@ with kpi_col4:
             latest_bat_time = df_bat_1h.index[-1]
             bat_val_str = f"{latest_bat:.2f} V"
             bat_time_str = latest_bat_time.strftime('(%H:%M)')
+            
+            time_diff_seconds = (datetime.now(MEXICO_TZ) - latest_bat_time).total_seconds()
+            if time_diff_seconds > (STALE_THRESHOLD_MINUTES * 60):
+                is_stale = True
+                bat_emoji = "⏳"
+                bat_time_str = f"(Hace >{STALE_THRESHOLD_MINUTES}m)"
+            else:
+                is_stale = False
         
-        st.metric(label=f"{bat_emoji} Batería {bat_time_str}", value=bat_val_str)
-        
-        # v55: Usar color verde para el gráfico de batería
+        st.metric(label=f"{bat_emoji} Batería {bat_time_str}", value=bat_val_str,
+                  help=f"Última lectura: {latest_bat_time.strftime('%H:%M:%S')}" if 'latest_bat_time' in locals() else "Sin datos")
+        st.markdown(f'<style>div[data-testid="stMetric"][data-stale="{is_stale}"]</style>', unsafe_allow_html=True)
         render_mini_chart(df_bat_1h, "#2ECC71")
 
 
@@ -953,7 +1046,6 @@ st.markdown("---")
 
 # --- FILA PRINCIPAL: MAPA (5) + ALERTAS (3) + TENDENCIAS (4) ---
 
-# Proporción (5, 3, 4) para el mapa, alertas y tendencias.
 col_map, col_alerts, col_trends = st.columns((5, 3, 4)) 
 
 with col_map:
@@ -975,30 +1067,52 @@ with col_map:
         """
         folium.Marker(location=map_center, popup=popup_html, icon=DivIcon(html=icon_html)).add_to(m)
     
-    # v58: FIX DEPRECATION WARNING.
-    # Se eliminan 'returned_objects' y 'use_container_width'.
-    # Se usa 'width="100%"' que es el parámetro correcto para st_folium.
     st_folium(m, height=500, width="100%")
     
 
 with col_alerts:
     # --- LOG DE ALERTAS (WEBHOOKS) ---
-    #
-    # === (MODIFICACIÓN v66) ===
-    # Revertido al contenedor original, como lo pediste.
     
-    st.subheader("🔔 Alertas en Vivo (Webhooks)")
+    # --- (INICIO MODIFICACIÓN v70) ---
     
-    # Renderiza el log de alertas con el nuevo manejo asíncrono
+    # 1. Mover el botón aquí y renombrar
+    if st.button("Limpiar Alertas", type="primary"):
+        if st.session_state.selected_vehicle_id:
+            # (v71) Pasar ambos IDs a la función de borrado
+            asyncio.run(clear_vehicle_alerts(
+                st.session_state.selected_vehicle_id, 
+                assigned_driver_id
+            ))
+            st.cache_data.clear() # Limpiar toda la caché
+            st.session_state.last_alert_id = None # Resetear el notificador
+            st.rerun() # Forzar refrecso de la página
+        else:
+            st.error("No hay vehículo seleccionado.") # Mostrar error aquí
+    # 2. Caption eliminado
+
+    # 3. Llamar a los logs *primero* para obtener la cuenta real
+    #    (El 'count' de autorefresh se usa como 'refresh_nonce')
+    #    (v71) Pasar ambos IDs
+    results = run_alert_log(
+        DATABASE_URL, 
+        count, 
+        st.session_state.selected_vehicle_id, 
+        assigned_driver_id
+    )
+    alert_count = len(results)
+
+    # 4. Usar la cuenta real 'alert_count' en el subheader (FIX v69)
+    st.subheader(f"🔔 Alertas del Vehículo ({alert_count})")
+    
     try:
-        # Se envuelve en un contenedor para que ocupe el espacio vertical
-        # La altura del contenedor será determinada por el contenido del mapa/tendencias.
         with st.container(border=True): 
-             render_alert_log_section()
+             # 5. Pasar los resultados ya obtenidos a la función de render
+             render_alert_log_section(results)
     except Exception as e:
-        # Esto se muestra si hay un problema al renderizar, por ejemplo si la DB está caída
         st.error(f"Error fatal al renderizar log de alertas: {e}")
         print(f"Error fatal al renderizar log de alertas: {e}")
+    
+    # --- (FIN MODIFICACIÓN v70) ---
     
 
 with col_trends:
@@ -1008,7 +1122,6 @@ with col_trends:
     df_ai_input = pd.DataFrame()
     step_sec_ai = 600
     
-    # Se renderizan las gráficas de Temperatura/Humedad (cada una tiene height=200 en render_history_charts)
     df_display = render_history_charts(df_history_24h, "(Últimas 24h)")
     
     st.markdown("<br>", unsafe_allow_html=True)
@@ -1024,7 +1137,6 @@ with col_trends:
             hovermode="x unified"
         )
         plotly_config = {'displayModeBar': False}
-        # v58: Corregido el warning. 'use_container_width' es correcto para plotly_chart
         st.plotly_chart(fig_bat_24h, config=plotly_config, use_container_width=True)
     else:
         st.info("No hay datos de batería disponibles (Últimas 24h).")
@@ -1044,7 +1156,7 @@ with st.container(border=True):
         step_sec_ai
     )
     
-    if forecast_values is not None and len(forecast_values) > 0:
+    if forecast_index is not None and len(forecast_values) > 0:
         df_forecast = pd.DataFrame({'timestamp': forecast_index, 'Predicción': forecast_values}).set_index('timestamp')
         df_real = df_ai_input[['temperature']].rename(columns={'temperature': 'Real'})
         df_plot = pd.concat([df_real, df_forecast])
@@ -1052,7 +1164,6 @@ with st.container(border=True):
         fig_fc = px.line(df_plot, markers=True, title="Predicción de Temperatura")
         fig_fc.update_layout(template="plotly_dark", yaxis_title="Temperatura °C", margin=dict(t=40, b=0, l=0, r=0))
         plotly_config = {'displayModeBar': False}
-        # v58: Corregido el warning. 'use_container_width' es correcto para plotly_chart
         st.plotly_chart(fig_fc, config=plotly_config, use_container_width=True) 
     else:
         st.info(f"Se necesitan al menos 5 puntos de datos para la predicción (actuales: {len(df_ai_input)}).")
