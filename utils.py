@@ -3,16 +3,13 @@
 #
 # Lógica de Backend, Cliente de API de Samsara e IA.
 #
+# v71 (Soporte de Conductor)
+# - (MODIFICADO) 'get_vehicles': Ahora usa 'include=driver' para
+#   obtener el conductor actualmente asignado a cada vehículo. Esto
+#   es esencial para la nueva lógica de filtrado de alertas.
+#
 # v44 (Optimización Full-Stack)
-# - OPTIMIZACIÓN: Se elimina la importación de 'time' y 'json' (no usados).
-# - OPTIMIZACIÓN: Se importa 'requests.adapters.HTTPAdapter' y 
-#   'urllib3.util.retry.Retry'.
-# - OPTIMIZACIÓN (API Client):
-#   1. Se utiliza 'requests.Session()' para persistencia de conexión.
-#   2. Se implementa una estrategia de reintentos (3 reintentos) con 
-#      'backoff_factor=1' para errores 429, 500, 502, 503, 504.
-#   3. '_make_request' se actualiza para usar 'self.session.request'
-#      en lugar de 'requests.get/post'.
+# - (OPTIMIZACIÓN) Se utiliza 'requests.Session()' y Reintentos.
 # --------------------------------------------------------------------------
 
 import requests
@@ -35,7 +32,7 @@ load_dotenv()
 SAMSARA_API_KEY = os.getenv("SAMSARA_API_KEY")
 
 if not SAMSARA_API_KEY:
-    raise ValueError("La variable SAMSARA_API_KEY no está configurada en el archivo .env")
+    print("ADVERTENCIA: La variable SAMSARA_API_KEY no está configurada en el archivo .env")
 
 SAMSARA_API_URL = "https://api.samsara.com"
 MEXICO_TZ = pytz.timezone("America/Mexico_City") 
@@ -62,9 +59,9 @@ class SamsaraAPIClient:
         self.session = requests.Session()
         retry_strategy = Retry(
             total=3,
-            backoff_factor=1, # Tiempo de espera = {backoff_factor} * (2 ** ({number_of_retries} - 1))
-            status_forcelist=[429, 500, 502, 503, 504], # Errores en los que reintentar
-            allowed_methods=["HEAD", "GET", "POST"] # Métodos en los que reintentar
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "POST"]
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("https://", adapter)
@@ -97,15 +94,26 @@ class SamsaraAPIClient:
             print(f"Error inesperado en la petición de API: {e}")
         return None
 
+    # --- (MODIFICADO v71) ---
     def get_vehicles(self):
-        """Obtiene la lista de todos los vehículos, incluyendo su 'sensorConfiguration'."""
-        print("API: Obteniendo lista de vehículos (con sensorConfiguration)...")
+        """
+        (v71) Obtiene la lista de todos los vehículos.
+        - Ahora incluye 'driver' y 'sensorConfiguration'.
+        """
+        print("API: Obteniendo lista de vehículos (con driver y sensorConfiguration)...")
         endpoint = "/fleet/vehicles"
-        params = {'limit': 500}
+        # (v71) Añadido 'include=driver'
+        params = {'limit': 500, 'include': 'driver,sensorConfiguration'} 
         data = self._make_request(endpoint, method="GET", params=params)
+        
         if data and 'data' in data:
-            print(f"API: Encontrados {len(data['data'])} vehículos activos.")
-            return data['data']
+            active_vehicles = [
+                v for v in data['data'] 
+                if v.get('gateway') and v.get('gateway').get('serial')
+            ]
+            print(f"API: Encontrados {len(active_vehicles)} vehículos activos.")
+            return active_vehicles
+            
         print("API: No se encontraron vehículos.")
         return []
 
