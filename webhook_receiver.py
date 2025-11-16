@@ -1,15 +1,15 @@
 # --------------------------------------------------------------------------
 # webhook_receiver.py
 #
-# Servidor de Webhooks (FastAPI) - v71
+# Servidor de Webhooks (FastAPI) - v73
 #
-# - (FIX v71): Corregida la lógica de parseo de 'AlertIncident'.
-#   - El 'vehicle_id' (para filtrar) ahora se busca en *todas* las
-#     alertas, incluido el objeto 'details.vehicle' en los formularios.
-#   - El 'vehicle_name' (Referencia) es el 'driver_id' para Formularios
-#     y el 'vehicle_name' para otras alertas.
-#   - SI Y SOLO SI no se encuentra un 'vehicle_id' en un formulario,
-#     se usará el 'driver_id' como 'vehicle_id' de respaldo.
+# - (MODIFICADO v73): Se elimina la lógica de parseo de la respuesta
+#   del formulario ("Form: Sí, es una emergencia").
+#   Ahora se guarda el 'description' original ("Form Submitted")
+#   directamente, como fue solicitado.
+#
+# - (FIX v71): Lógica de 'vehicle_id' de respaldo (usar driver_id)
+#   se mantiene, ya que es crucial.
 # --------------------------------------------------------------------------
 
 import os
@@ -185,7 +185,7 @@ async def receive_webhook(request: Request):
         logger.info("Ping de Samsara recibido. ¡La conexión funciona!")
         return {"status": "success", "ping_received": True}
 
-    # --- (MODIFICADO v71) ---
+    # --- (MODIFICADO v73) ---
     if payload.eventType == "AlertIncident" and payload.data:
         try:
             alert_data = payload.data
@@ -198,6 +198,7 @@ async def receive_webhook(request: Request):
             first_condition = conditions[0]
             
             # --- Variables a popular ---
+            # (v73) 'alert_type_str' ahora es el 'description' original.
             alert_type_str = first_condition.get("description", "Alerta Desconocida") 
             details = first_condition.get("details", {}) 
             vehicle_name_str = "N/A" # "Referencia"
@@ -210,11 +211,9 @@ async def receive_webhook(request: Request):
             if happened_at_time_str:
                 happened_at_time_dt = datetime.fromisoformat(happened_at_time_str.replace('Z', '+00:00'))
             
-            # --- LÓGICA DE PARSEO (v71) ---
+            # --- LÓGICA DE PARSEO (v71/v73) ---
 
             # PASO 1: (v71) Buscar un VEHÍCULO genérico en 'details'.
-            # Esto es clave, ya que "Form Submitted" SÍ puede incluir este objeto
-            # si la alerta está configurada para monitorear un vehículo.
             if "vehicle" in details and details.get("vehicle"):
                 vehicle_data = details["vehicle"]
                 vehicle_id_str = vehicle_data.get("id", "N/A")
@@ -222,43 +221,31 @@ async def receive_webhook(request: Request):
                 logger.info(f"Parseo v71 (Paso 1): Encontrado vehículo genérico: {vehicle_id_str}")
 
             # PASO 2: Buscar IDs de vehículo en alertas específicas (Gateway)
-            # Esto puede sobrescribir la Referencia si es más específico
             if details.get("gatewayUnplugged") and details["gatewayUnplugged"].get("vehicle"):
                 vehicle_data = details["gatewayUnplugged"]["vehicle"]
-                vehicle_id_str = vehicle_data.get("id", vehicle_id_str) # Usar ID si no hay uno
-                vehicle_name_str = vehicle_data.get("name", "N/A") # Referencia = Vehicle Name
+                vehicle_id_str = vehicle_data.get("id", vehicle_id_str) 
+                vehicle_name_str = vehicle_data.get("name", "N/A")
             
             elif details.get("gatewayDisconnected") and details["gatewayDisconnected"].get("vehicle"):
                 vehicle_data = details["gatewayDisconnected"]["vehicle"]
-                vehicle_id_str = vehicle_data.get("id", vehicle_id_str) # Usar ID si no hay uno
-                vehicle_name_str = vehicle_data.get("name", "N/A") # Referencia = Vehicle Name
+                vehicle_id_str = vehicle_data.get("id", vehicle_id_str)
+                vehicle_name_str = vehicle_data.get("name", "N/A")
 
-            # PASO 3: Si es "Form Submitted", *modificar* el tipo de alerta
-            # y *sobrescribir* la REFERENCIA (vehicle_name) al Driver ID.
+            # PASO 3: Si es "Form Submitted", buscar el ID del conductor
             if alert_type_str == "Form Submitted" and details.get("formSubmitted"):
                 form_data = details.get("formSubmitted", {}).get("form", {})
-                fields = form_data.get("fields", [])
-                emergency_answer = "N/D"
-                question_to_find = "¿Tienes una emergencia (accidente, riesgo médico, robo)?" 
+                
+                # (v73) La lógica de parseo de la pregunta se ha eliminado.
+                # 'alert_type_str' ya es "Form Submitted".
 
-                for field in fields:
-                    if field.get("label") == question_to_find:
-                        if field.get("multipleChoiceValue"):
-                            emergency_answer = field["multipleChoiceValue"].get("value", "N/D")
-                            break
-                
-                # (v68) Formato: "Form: [Respuesta]"
-                alert_type_str = f"Form: {emergency_answer}"
-                
                 submitter_info = form_data.get("submittedBy")
                 if submitter_info and submitter_info.get("type") == "driver":
                     driver_id = submitter_info.get('id', 'N/A')
-                    # (v7al 1) La *Referencia* (vehicle_name) es el Driver ID
+                    # (v71) La *Referencia* (vehicle_name) es el Driver ID
                     vehicle_name_str = driver_id 
                     
                     # (FIX v71) Si *aún* no tenemos un vehicle_id (del Paso 1 o 2),
-                    # entonces este es un formulario "sin vehículo" y usamos el
-                    # driver_id como el ID de filtro.
+                    # usamos el driver_id como el ID de filtro.
                     if vehicle_id_str == "N/A":
                         vehicle_id_str = driver_id
                         logger.info(f"Parseo v71 (Paso 3): Formulario sin vehículo. Usando Driver ID ({driver_id}) como ID de filtro.")
@@ -270,7 +257,7 @@ async def receive_webhook(request: Request):
             event_to_store = {
                 "event_id": payload.eventId,
                 "timestamp": happened_at_time_dt, 
-                "alert_type": alert_type_str,
+                "alert_type": alert_type_str, # (v73) Ahora es "Form Submitted"
                 "message": details,
                 "vehicle_name": vehicle_name_str,  # "Referencia"
                 "vehicle_id": vehicle_id_str,      # "ID de Filtro"
@@ -296,4 +283,3 @@ async def receive_webhook(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-# <-- CORRECCIÓN: El '}' extra ha sido eliminado.
