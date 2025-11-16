@@ -253,7 +253,7 @@ async def receive_webhook(request: Request):
                 submitter_info = form_data.get("submittedBy")
                 if submitter_info and submitter_info.get("type") == "driver":
                     driver_id = submitter_info.get('id', 'N/A')
-                    # (v71) La *Referencia* (vehicle_name) es el Driver ID
+                    # (v7al 1) La *Referencia* (vehicle_name) es el Driver ID
                     vehicle_name_str = driver_id 
                     
                     # (FIX v71) Si *aún* no tenemos un vehicle_id (del Paso 1 o 2),
@@ -296,4 +296,4 @@ async def receive_webhook(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-}
+# <-- CORRECCIÓN: El '}' extra ha sido eliminado.
