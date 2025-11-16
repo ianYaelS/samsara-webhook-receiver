@@ -1,9 +1,9 @@
 # --------------------------------------------------------------------------
 # webhook_receiver.py
 #
-# Servidor de Webhooks (FastAPI) - v66
+# Servidor de Webhooks (FastAPI) - v67 (Lógica v66 confirmada)
 #
-# - (NUEVO v66): Modificada la lógica de 'AlertIncident' (Form Submitted):
+# - (v66): Modificada la lógica de 'AlertIncident' (Form Submitted):
 #   - La 'Referencia' (vehicle_name) ahora es el 'driver_id' (ej. "54432217")
 #     en lugar de "Form Submitted by: ID".
 # - (v65): Añadida columna 'incident_url' a la base de datos.
@@ -221,7 +221,8 @@ async def receive_webhook(request: Request):
             details = first_condition.get("details", {}) 
             vehicle_name_str = "N/A" # Esta es la "Referencia"
             vehicle_id_str = "N/A"
-            incident_url_str = alert_data.get("incidentUrl") # (REQUISITO v65)
+            # Esta es la línea clave: extrae 'incidentUrl' del payload 'data'
+            incident_url_str = alert_data.get("incidentUrl") 
             # ---
 
             happened_at_time_str = alert_data.get("happenedAtTime")
@@ -270,6 +271,7 @@ async def receive_webhook(request: Request):
 
             # --- Fin de Lógica de Parseo ---
 
+            # Aquí es donde se guarda en la base de datos
             event_to_store = {
                 "event_id": payload.eventId,
                 "timestamp": happened_at_time_dt, 
@@ -277,11 +279,11 @@ async def receive_webhook(request: Request):
                 "message": details,                # JSON de detalles
                 "vehicle_name": vehicle_name_str,  # "Referencia" (Vehículo o Driver ID)
                 "vehicle_id": vehicle_id_str,      # ID (Vehículo o Driver)
-                "incident_url": incident_url_str,  # (NUEVO v65)
+                "incident_url": incident_url_str,  # (NUEVO v65) -> Aquí se pasa la URL
                 "raw_json": payload.dict() 
             }
             
-            logger.info(f"Insertando Alerta: {alert_type_str} para {vehicle_name_str}")
+            logger.info(f"Insertando Alerta: {alert_type_str} para {vehicle_name_str} (URL: {incident_url_str})")
             
             query = alerts.insert().values(event_to_store)
             await database.execute(query)
