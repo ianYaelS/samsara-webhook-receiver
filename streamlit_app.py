@@ -3,13 +3,18 @@
 #
 # Aplicación Principal del Dashboard "Reefer-Tech" con Streamlit.
 #
-# v72 (Mejoras de UI de Alertas)
+# v75 (UnhashableParamError FIX)
+# - (FIX) Solucionado el 'UnhashableParamError' de la v74.
+# - (MOD) El argumento 'loop' en 'run_alert_log' se renombra a '_loop'
+#   tanto en la definición de la función (para que @st.cache_data lo ignore)
+#   como en la llamada a la función.
 #
-# 1. (UI) La tabla de alertas ahora muestra las 7 últimas alertas (limit 7).
-# 2. (UI) La columna "Hora" se reemplaza por "Fecha / Hora"
-#    con el formato YYYY-MM-DD HH:MM.
-# 3. (UI) Se elimina la columna "Referencia" de la tabla de alertas
-#    para una vista más limpia.
+# v74 (Asyncio Loop FIX)
+# - (FIX) Solucionado el error 'pool is closed' / 'Event loop is closed'
+#   usando un bucle de eventos 'asyncio' único por sesión.
+#
+# v72 (Mejoras de UI de Alertas)
+# - (UI) Límite de 7 alertas, formato de fecha YYYY-MM-DD HH:MM.
 #
 # (Depende de utils.py v73 para funcionar)
 # --------------------------------------------------------------------------
@@ -100,6 +105,30 @@ def get_database_connection(db_url):
 
 database = get_database_connection(DATABASE_URL)
 metadata_db = alerts.metadata # Usamos el metadata asociado a la tabla alerts
+
+
+# --- (NUEVO v74) SOLUCIÓN AL PROBLEMA DE ASYNCIO ---
+@st.cache_resource
+def get_or_create_eventloop():
+    """
+    Obtiene el bucle de eventos 'asyncio' existente o crea uno nuevo
+    si no existe. Esto previene el error 'Event loop is closed'.
+    """
+    try:
+        # Intenta obtener el bucle de eventos actual en el hilo
+        return asyncio.get_event_loop()
+    except RuntimeError as ex:
+        # Si no hay bucle, crea uno nuevo y establécelo
+        if "There is no current event loop in thread" in str(ex):
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            print("INFO (v74): Se creó un nuevo bucle de eventos 'asyncio' para este hilo.")
+            return loop
+        
+# Obtenemos el bucle único para esta sesión de Streamlit
+main_event_loop = get_or_create_eventloop()
+# ----------------------------------------------------
+
 
 # --- INICIALIZACIÓN DE SESSION_STATE ---
 try:
@@ -351,27 +380,27 @@ def render_vehicle_info_and_sensors(vehicle_obj, sensor_config):
         st.sidebar.error("No se ha seleccionado ningún vehículo.")
         return
         
-    st.sidebar.markdown(f"<div class'vehicle-info-header'>Vehículo</div>", unsafe_allow_html=True)
-    st.sidebar.markdown(f"<div class'vehicle-info-value'>{vehicle_obj.get('name', 'N/A')}</div>", unsafe_allow_html=True)
+    st.sidebar.markdown(f"<div class='vehicle-info-header'>Vehículo</div>", unsafe_allow_html=True)
+    st.sidebar.markdown(f"<div class='vehicle-info-value'>{vehicle_obj.get('name', 'N/A')}</div>", unsafe_allow_html=True)
     
     if vehicle_obj.get('serial'):
-        st.sidebar.markdown(f"<div class'vehicle-info-header' style='margin-top: 5px;'>Serial</div>", unsafe_allow_html=True)
-        st.sidebar.markdown(f"<div class'vehicle-info-value'>{vehicle_obj.get('serial')}</div>", unsafe_allow_html=True)
+        st.sidebar.markdown(f"<div class='vehicle-info-header' style='margin-top: 5px;'>Serial</div>", unsafe_allow_html=True)
+        st.sidebar.markdown(f"<div class='vehicle-info-value'>{vehicle_obj.get('serial')}</div>", unsafe_allow_html=True)
     
-    st.sidebar.markdown(f"<div class'vehicle-info-header' style='margin-top: 5px;'>ID</div>", unsafe_allow_html=True)
-    st.sidebar.markdown(f"<div class'vehicle-info-value'>{vehicle_obj.get('id')}</div>", unsafe_allow_html=True)
+    st.sidebar.markdown(f"<div class='vehicle-info-header' style='margin-top: 5px;'>ID</div>", unsafe_allow_html=True)
+    st.sidebar.markdown(f"<div class='vehicle-info-value'>{vehicle_obj.get('id')}</div>", unsafe_allow_html=True)
     
     # (v71) Mostrar conductor asignado
     if st.session_state.assigned_driver_id:
-        st.sidebar.markdown(f"<div class'vehicle-info-header' style='margin-top: 5px;'>Conductor Asignado (para Alertas)</div>", unsafe_allow_html=True)
-        st.sidebar.markdown(f"<div class'vehicle-info-value'>{st.session_state.assigned_driver_id}</div>", unsafe_allow_html=True)
+        st.sidebar.markdown(f"<div class='vehicle-info-header' style='margin-top: 5px;'>Conductor Asignado (para Alertas)</div>", unsafe_allow_html=True)
+        st.sidebar.markdown(f"<div class='vehicle-info-value'>{st.session_state.assigned_driver_id}</div>", unsafe_allow_html=True)
     else:
         # (v73) Mostrar si no hay conductor
-        st.sidebar.markdown(f"<div class'vehicle-info-header' style='margin-top: 5px;'>Conductor Asignado (para Alertas)</div>", unsafe_allow_html=True)
-        st.sidebar.markdown(f"<div class'vehicle-info-value' style='color: #ffc107;'>Ninguno (API reportó 'None')</div>", unsafe_allow_html=True)
+        st.sidebar.markdown(f"<div class='vehicle-info-header' style='margin-top: 5px;'>Conductor Asignado (para Alertas)</div>", unsafe_allow_html=True)
+        st.sidebar.markdown(f"<div class='vehicle-info-value' style='color: #ffc107;'>Ninguno (API reportó 'None')</div>", unsafe_allow_html=True)
 
     
-    st.sidebar.markdown(f"<div class'sensor-list-header' style='margin-top: 10px;'>Dispositivos Pareados</div>", unsafe_allow_html=True)
+    st.sidebar.markdown(f"<div class='sensor-list-header' style='margin-top: 10px;'>Dispositivos Pareados</div>", unsafe_allow_html=True)
     
     if not sensor_config:
         st.sidebar.caption("No hay 'sensorConfiguration' para este vehículo.")
@@ -518,7 +547,6 @@ def render_mini_chart(series_data, color):
         showlegend=False,
     )
     config = {'displayModeBar': False}
-    # v58: Corregido el warning. 'use_container_width' es correcto para plotly_chart
     st.plotly_chart(fig, config=config, use_container_width=True)
 
 
@@ -541,7 +569,6 @@ def render_history_charts(df, title_suffix):
             margin=dict(t=40, b=40, l=0, r=0),
             hovermode="x unified"
         )
-        # v58: Corregido el warning. 'use_container_width' es correcto para plotly_chart
         temp_chart_placeholder.plotly_chart(fig_temp, config=plotly_config, use_container_width=True)
     else:
         temp_chart_placeholder.info(f"No hay datos de temperatura disponibles ({title_suffix}).")
@@ -557,28 +584,25 @@ def render_history_charts(df, title_suffix):
             margin=dict(t=40, b=40, l=0, r=0),
             hovermode="x unified"
         )
-        # v58: Corregido el warning. 'use_container_width' es correcto para plotly_chart
         hum_chart_placeholder.plotly_chart(fig_hum, config=plotly_config, use_container_width=True)
     else:
         hum_chart_placeholder.info(f"No hay datos de humedad disponibles ({title_suffix}).")
     
     return df
 
-# --- (MODIFICADO v72) ---
-@st.cache_data(ttl=8) # TTL de 8s (protección contra ráfagas)
-def run_alert_log(database_url_key, refresh_nonce, vehicle_id, driver_id):
+# --- (MODIFICADO v74) ---
+# Esta es la función asíncrona real.
+# Se ha modificado para ser más robusta con la gestión de conexiones.
+async def fetch_alerts(vid, did):
     """
-    (v71) Función de contenedor no-asíncrona para la lógica asíncrona de alertas.
-    - 'refresh_nonce' (del autorefresh) es la clave para forzar el refresco de caché.
-    - 'vehicle_id' y 'driver_id' filtran las alertas.
-    (v72) - Límite cambiado a 7.
+    Función asíncrona real que interactúa con la base de datos.
     """
-    async def fetch_alerts(vid, did):
-        """
-        Función asíncrona real que interactúa con la base de datos.
-        """
+    try:
         if not database.is_connected:
+            print("FETCH_ALERTS (v74): Conectando a la base de datos...")
             await database.connect()
+        else:
+            print("FETCH_ALERTS (v74): La base de datos ya está conectada.")
             
         # (v71) Consulta ahora filtra por vehicle_id O driver_id (si existe)
         filter_conditions = [alerts.c.vehicle_id == vid]
@@ -587,7 +611,6 @@ def run_alert_log(database_url_key, refresh_nonce, vehicle_id, driver_id):
             print(f"FETCH_ALERTS (v71): Buscando por vehicle_id={vid} O driver_id={did}")
         else:
             print(f"FETCH_ALERTS (v71): Buscando solo por vehicle_id={vid} (sin conductor asignado)")
-
         
         query = alerts.select().where(
             or_(*filter_conditions) # Usar 'or_' para combinar las condiciones
@@ -599,31 +622,68 @@ def run_alert_log(database_url_key, refresh_nonce, vehicle_id, driver_id):
         
         serializable_results = [dict(row._mapping) for row in results]
         
-        try:
-            # (v73) Asegurar que la desconexión solo ocurra si está conectada
-            if database.is_connected:
-                await database.disconnect() 
-        except Exception as e:
-            print(f"Advertencia al desconectar DB: {e}") 
+        # (v74) NO desconectamos aquí. Dejamos que el pool viva.
+        # El bucle de eventos persistente mantendrá el pool.
         
         return serializable_results
+    
+    except Exception as e:
+        print(f"Error en fetch_alerts (async): {e}")
+        # Si la conexión falla (ej. "pool is closed"), intentar reconectar una vez.
+        if "pool is closed" in str(e) or "connection was closed" in str(e):
+            try:
+                print("FETCH_ALERTS (v74): El pool estaba cerrado. Intentando reconectar...")
+                if database.is_connected:
+                    await database.disconnect() # Forzar cierre por si acaso
+                await database.connect()
+                print("FETCH_ALERTS (v74): Reconexión exitosa. Reintentando consulta...")
+                # (v75) Necesitamos re-definir la query aquí para el scope del 'except'
+                filter_conditions = [alerts.c.vehicle_id == vid]
+                if did:
+                    filter_conditions.append(alerts.c.vehicle_id == did)
+                query = alerts.select().where(
+                    or_(*filter_conditions)
+                ).order_by(
+                    alerts.c.timestamp.desc()
+                ).limit(7)
+                
+                results = await database.fetch_all(query) # Reintentar la consulta
+                return [dict(row._mapping) for row in results]
+            except Exception as e2:
+                print(f"Error en fetch_alerts (reintento): {e2}")
+                return [] # Fallar silenciosamente
+        return [] # Fallar silenciosamente
 
+
+# (MODIFICADO v75)
+@st.cache_data(ttl=8) # TTL de 8s (protección contra ráfagas)
+def run_alert_log(database_url_key, refresh_nonce, vehicle_id, driver_id, _loop):
+    """
+    (v75) Función de contenedor no-asíncrona.
+    - Argumento '_loop' es ignorado por @st.cache_data para
+      solucionar el 'UnhashableParamError'.
+    """
     try:
         # El 'refresh_nonce' asegura que esta función se re-ejecute
         print(f"RUN_ALERT_LOG: Refrescando alertas para veh={vehicle_id}, drv={driver_id} (Nonce: {refresh_nonce})")
-        results = asyncio.run(fetch_alerts(vehicle_id, driver_id))
+        # (v74) Usar el bucle de eventos persistente
+        results = _loop.run_until_complete(fetch_alerts(vehicle_id, driver_id))
         return results
     except Exception as e:
-        print(f"Error en run_alert_log (fetch_alerts): {e}")
+        print(f"Error en run_alert_log (sync wrapper): {e}")
         return []
 
-# --- (MODIFICADO v71) ---
+
+# --- (MODIFICADO v74) ---
+# Esta es la función asíncrona real
 async def clear_vehicle_alerts(vehicle_id, driver_id):
     """
     (v71) Función asíncrona para borrar alertas de un vehículo Y su conductor.
+    (v74) Gestión de conexión robustecida.
     """
     try:
         if not database.is_connected:
+            print("CLEAR_ALERTS (v74): Conectando a la base de datos...")
             await database.connect()
         
         # (v71) Borrar por vehicle_id O driver_id (si existe)
@@ -634,13 +694,12 @@ async def clear_vehicle_alerts(vehicle_id, driver_id):
         query = alerts.delete().where(or_(*filter_conditions))
         await database.execute(query)
         
-        if database.is_connected:
-            await database.disconnect()
+        # (v74) NO desconectamos.
         
         print(f"ALERT_CLEAR: Alertas borradas para veh={vehicle_id} o drv={driver_id}")
         return True
     except Exception as e:
-        print(f"Error en clear_vehicle_alerts: {e}")
+        print(f"Error en clear_vehicle_alerts (async): {e}")
         return False
 
 # --- (MODIFICADO v72) ---
@@ -666,7 +725,7 @@ def render_alert_log_section(results):
         alert_msg = f"¡Nueva Alerta: {results[0]['alert_type']} en {results[0]['vehicle_name']}!"
         st.error(alert_msg, icon="🚨")
         
-        audio_url = "https://cdn.pixabay.com/audio/22/03/15/audio_2210e72c83.mp3"
+        audio_url = "https.cdn.pixabay.com/audio/22/03/15/audio_2210e72c83.mp3"
         st.markdown(
             f"""
             <audio autoplay controls style="display:none;">
@@ -1073,13 +1132,15 @@ with col_map:
 with col_alerts:
     # --- LOG DE ALERTAS (WEBHOOKS) ---
     
-    # --- (INICIO MODIFICACIÓN v70) ---
+    # --- (INICIO MODIFICACIÓN v75) ---
     
     # 1. Mover el botón aquí y renombrar
     if st.button("Limpiar Alertas", type="primary"):
         if st.session_state.selected_vehicle_id:
-            # (v71) Pasar ambos IDs a la función de borrado
-            asyncio.run(clear_vehicle_alerts(
+            # (v74) Usar el bucle de eventos persistente
+            print("BOTÓN LIMPIAR: Ejecutando clear_vehicle_alerts...")
+            loop = get_or_create_eventloop()
+            loop.run_until_complete(clear_vehicle_alerts(
                 st.session_state.selected_vehicle_id, 
                 assigned_driver_id
             ))
@@ -1092,12 +1153,13 @@ with col_alerts:
 
     # 3. Llamar a los logs *primero* para obtener la cuenta real
     #    (El 'count' de autorefresh se usa como 'refresh_nonce')
-    #    (v71) Pasar ambos IDs
+    #    (v75) Pasar el bucle de eventos persistente como '_loop'
     results = run_alert_log(
         DATABASE_URL, 
         count, 
         st.session_state.selected_vehicle_id, 
-        assigned_driver_id
+        assigned_driver_id,
+        _loop=main_event_loop # <--- (v75) Se llama al argumento con '_'
     )
     alert_count = len(results)
 
@@ -1112,7 +1174,7 @@ with col_alerts:
         st.error(f"Error fatal al renderizar log de alertas: {e}")
         print(f"Error fatal al renderizar log de alertas: {e}")
     
-    # --- (FIN MODIFICACIÓN v70) ---
+    # --- (FIN MODIFICACIÓN v75) ---
     
 
 with col_trends:
