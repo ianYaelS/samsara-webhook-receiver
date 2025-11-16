@@ -3,13 +3,14 @@
 #
 # Lógica de Backend, Cliente de API de Samsara e IA.
 #
-# v71 (Soporte de Conductor)
-# - (MODIFICADO) 'get_vehicles': Ahora usa 'include=driver' para
-#   obtener el conductor actualmente asignado a cada vehículo. Esto
-#   es esencial para la nueva lógica de filtrado de alertas.
+# v73 (Mapeo de Respaldo)
+# - (NUEVO) Añadido 'MANUAL_DRIVER_FALLBACK_MAP'.
+#   Esto soluciona el problema de que la API de Samsara
+#   reporte 'driver=None' para un vehículo, aunque el conductor
+#   esté enviando formularios. Esto fuerza la conexión en el dashboard.
 #
-# v44 (Optimización Full-Stack)
-# - (OPTIMIZACIÓN) Se utiliza 'requests.Session()' y Reintentos.
+# v71 (Soporte de Conductor)
+# - (MODIFICADO) 'get_vehicles': Ahora usa 'include=driver'.
 # --------------------------------------------------------------------------
 
 import requests
@@ -37,68 +38,37 @@ if not SAMSARA_API_KEY:
 SAMSARA_API_URL = "https://api.samsara.com"
 MEXICO_TZ = pytz.timezone("America/Mexico_City") 
 
+# --- (NUEVO v73) MAPEO DE RESPALDO ---
+# Si la API de Samsara (include=driver) falla y devuelve 'None'
+# para un vehículo, este mapa manual forzará la conexión.
+# Formato: { 'ID_VEHICULO': 'ID_CONDUCTOR_ASOCIADO' }
+MANUAL_DRIVER_FALLBACK_MAP = {
+    '281474999306395': '54432217'
+}
+# ------------------------------------
+
 
 # --- 2. CLIENTE DE LA API DE SAMSARA (CON REINTENTOS) ---
 
 class SamsaraAPIClient:
     def __init__(self, api_key):
-        self.api_key = api_key
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
-        self.v1_headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "X-Api-Key": self.api_key
-        }
-        
-        # (v44) Configuración de Sesión y Reintentos
-        self.session = requests.Session()
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "POST"]
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("https://", adapter)
+# ... existing code ...
         self.session.mount("http://", adapter)
         
         print(f"Cliente de API inicializado con reintentos (3x).")
 
     def _make_request(self, endpoint, method="GET", params=None, json_data=None, is_v1=False):
-        """Helper function to make API requests with error handling and retries."""
-        url = f"{SAMSARA_API_URL}{endpoint}"
-        headers_to_use = self.v1_headers if is_v1 else self.headers
-        
-        try:
-            response = self.session.request(
-                method=method.upper(),
-                url=url,
-                headers=headers_to_use,
-                params=params,
-                json=json_data,
-                timeout=10 # 10 segundos de timeout
-            )
-            response.raise_for_status() # Lanza un error para códigos 4xx/5xx
-            return response.json()
-        
-        except requests.exceptions.HTTPError as http_err:
-            print(f"Error HTTP (después de reintentos): {http_err} - {http_err.response.text}")
-        except requests.exceptions.RequestException as req_err:
-            print(f"Error de Petición (después de reintentos): {req_err}")
+# ... existing code ...
         except Exception as e:
             print(f"Error inesperado en la petición de API: {e}")
         return None
 
-    # --- (MODIFICADO v71) ---
+    # --- (MODIFICADO v73) ---
     def get_vehicles(self):
         """
-        (v71) Obtiene la lista de todos los vehículos.
-        - Ahora incluye 'driver' y 'sensorConfiguration'.
+        (v71) Obtiene la lista de todos los vehículos (con driver y sensorConfiguration).
+        (v73) Aplica el 'MANUAL_DRIVER_FALLBACK_MAP' si la API de 'include=driver'
+              devuelve 'None' para un vehículo conocido.
         """
         print("API: Obteniendo lista de vehículos (con driver y sensorConfiguration)...")
         endpoint = "/fleet/vehicles"
@@ -112,10 +82,32 @@ class SamsaraAPIClient:
                 if v.get('gateway') and v.get('gateway').get('serial')
             ]
             print(f"API: Encontrados {len(active_vehicles)} vehículos activos.")
-            return active_vehicles
+            
+            # (v73) Aplicar lógica de Mapeo de Respaldo
+            # Paso 1: Crear el mapa desde la API (puede tener 'None')
+            vehicle_driver_map_api = {}
+            for v in active_vehicles:
+                driver_id_api = None
+                if "driver" in v and v["driver"]: # Comprobar que 'driver' no sea None
+                    driver_id_api = v["driver"].get("id")
+                vehicle_driver_map_api[v["id"]] = driver_id_api
+            
+            print(f"Vehicle/Driver Map (API): {vehicle_driver_map_api}")
+
+            # Paso 2: Aplicar el respaldo
+            # Copiamos el mapa para modificarlo
+            final_vehicle_driver_map = vehicle_driver_map_api.copy()
+            for vehicle_id, driver_id_api in final_vehicle_driver_map.items():
+                if driver_id_api is None and vehicle_id in MANUAL_DRIVER_FALLBACK_MAP:
+                    fallback_driver_id = MANUAL_DRIVER_FALLBACK_MAP[vehicle_id]
+                    final_vehicle_driver_map[vehicle_id] = fallback_driver_id
+                    print(f"  -> AVISO (v73): Se aplicó respaldo manual para {vehicle_id}. Conductor {fallback_driver_id} asignado.")
+
+            # Devolvemos los vehículos Y el mapa final corregido
+            return active_vehicles, final_vehicle_driver_map
             
         print("API: No se encontraron vehículos.")
-        return []
+        return [], {}
 
     def get_live_stats(self, vehicle_id):
         """(SNAPSHOT) Obtiene GPS, Batería y Fallas (último valor)."""
